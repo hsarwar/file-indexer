@@ -6,6 +6,26 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_MIN_INDEX_SIZE_BYTES: u64 = 8 * 1024;
+
+const DEFAULT_MEDIA_EXTENSIONS: &[&str] = &[
+    "3fr", "3g2", "3gp", "8svx", "aa", "aac", "aax", "ac3", "act", "adt", "adts", "aif", "aifc",
+    "aiff", "alac", "amr", "amv", "ape", "apng", "ari", "arw", "asf", "au", "avif", "avi", "avs",
+    "bay", "bik", "bik2", "bmp", "caf", "cap", "cda", "cr2", "cr3", "crw", "cue", "dcm", "dcr",
+    "dcs", "dff", "divx", "dng", "drf", "dsf", "dts", "dv", "eip", "erf", "evo", "f4a", "f4b",
+    "f4p", "f4v", "fff", "fit", "fits", "flac", "fli", "flif", "flv", "gif", "gsm", "h264",
+    "h265", "hdr", "heic", "heif", "hevc", "ico", "iiq", "it", "j2c", "j2k", "jfif", "jp2", "jpc",
+    "jpe", "jpeg", "jpg", "jpm", "jpx", "jxl", "k25", "kdc", "m1v", "m2p", "m2t", "m2ts", "m2v",
+    "m4a", "m4b", "m4p", "m4v", "mef", "mid", "midi", "mjpeg", "mjpg", "mk3d", "mka", "mkv", "mod",
+    "mov", "mos", "mp1", "mp2", "mp3", "mp4", "mpa", "mpc", "mpe", "mpeg", "mpg", "mpv", "mrw",
+    "mts", "mxf", "nef", "nrw", "nsv", "nut", "oga", "ogg", "ogm", "ogv", "opus", "orf", "pam",
+    "pbm", "pcx", "pef", "pfm", "pgm", "png", "pnm", "ppm", "psb", "psd", "ptx", "pxn", "qoi",
+    "qt", "ra", "raf", "ram", "raw", "rle", "rm", "rmvb", "roq", "rw2", "rwl", "rwz", "s3m",
+    "snd", "sr2", "srf", "srw", "svg", "swf", "tak", "tga", "tif", "tiff", "tod", "ts", "tta",
+    "voc", "vob", "vox", "w64", "wav", "wbmp", "webm", "webp", "wma", "wmv", "wv", "x3f", "xm",
+    "xpm", "y4m",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SortField {
     Name,
@@ -32,6 +52,9 @@ pub struct FavoriteSearch {
 pub struct AppConfig {
     pub selected_roots: Vec<String>,
     pub favorites: Vec<FavoriteSearch>,
+    pub index_all_extensions: bool,
+    pub indexed_extensions: String,
+    pub min_index_size_bytes: u64,
 }
 
 impl Default for AppConfig {
@@ -39,6 +62,9 @@ impl Default for AppConfig {
         Self {
             selected_roots: available_roots(),
             favorites: Vec::new(),
+            index_all_extensions: false,
+            indexed_extensions: default_indexed_extensions(),
+            min_index_size_bytes: DEFAULT_MIN_INDEX_SIZE_BYTES,
         }
     }
 }
@@ -56,15 +82,6 @@ impl AppConfig {
         Ok(config)
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-
-        let raw = serde_json::to_string_pretty(self)?;
-        fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
-    }
 }
 
 pub fn app_data_dir() -> Result<PathBuf> {
@@ -103,6 +120,10 @@ pub fn available_roots() -> Vec<String> {
         }
     }
     roots
+}
+
+pub fn default_indexed_extensions() -> String {
+    DEFAULT_MEDIA_EXTENSIONS.join(" ")
 }
 
 fn is_writable_directory(path: &Path) -> bool {

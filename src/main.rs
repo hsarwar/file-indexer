@@ -22,7 +22,7 @@ use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
 use config::{
     AppConfig, FavoriteSearch, SortDirection, SortField, available_roots, config_path,
-    database_path,
+    database_path, default_indexed_extensions,
 };
 use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke, Vec2};
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader, RgbaImage};
@@ -45,6 +45,7 @@ use windows::{
     core::PCWSTR,
 };
 use scanner::ScanStats;
+use scanner::ScanFilter;
 
 const PAGE_SIZE: usize = 100;
 const H1_SIZE: f32 = 28.0;
@@ -284,6 +285,9 @@ struct FileIndexerApp {
     ffmpeg_preview_settings: FfmpegPreviewSettings,
     ffmpeg_thumbnail_count_input: String,
     ffmpeg_interval_seconds_input: String,
+    index_all_extensions: bool,
+    indexed_extensions_input: String,
+    min_index_size_bytes_input: String,
     startup_maximize_delay_frames: u8,
     preview: PreviewState,
 }
@@ -344,16 +348,23 @@ enum ScanMessage {
 impl FileIndexerApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Result<Self> {
         configure_theme(&cc.egui_ctx);
-        let config = AppConfig::load(&config_path()?)?;
+        let legacy_config = config_path()
+            .ok()
+            .filter(|path| path.exists())
+            .and_then(|path| AppConfig::load(&path).ok());
         let db_path = database_path()?;
         let db_path_label = db_path.display().to_string();
         let db = IndexStore::new(db_path)?;
+        let config = db.load_app_config(legacy_config.as_ref())?;
         let ffmpeg_preview_settings = db
             .load_ffmpeg_preview_settings()
             .unwrap_or(FfmpegPreviewSettings {
                 thumbnail_count: DEFAULT_FFMPEG_PREVIEW_FRAME_COUNT,
                 interval_seconds: DEFAULT_FFMPEG_PREVIEW_INTERVAL_SECONDS,
             });
+        let index_all_extensions = config.index_all_extensions;
+        let indexed_extensions_input = config.indexed_extensions.clone();
+        let min_index_size_bytes_input = config.min_index_size_bytes.to_string();
         let total_files = db.total_files().unwrap_or_default();
         let last_scan_label = format_last_scan(db.last_scan_unix_secs().ok().flatten());
         let root_scan_info = map_root_scan_info(db.root_scan_info().unwrap_or_default());
@@ -378,6 +389,9 @@ impl FileIndexerApp {
             video_preview_backend: VideoPreviewBackend::WindowsShell,
             ffmpeg_thumbnail_count_input: ffmpeg_preview_settings.thumbnail_count.to_string(),
             ffmpeg_interval_seconds_input: ffmpeg_preview_settings.interval_seconds.to_string(),
+            index_all_extensions,
+            indexed_extensions_input,
+            min_index_size_bytes_input,
             ffmpeg_preview_settings,
             startup_maximize_delay_frames: 8,
             preview: PreviewState::default(),
@@ -653,10 +667,28 @@ impl FileIndexerApp {
     }
 
     fn save_config(&mut self) {
-        match config_path().and_then(|path| self.config.save(&path)) {
+        match self.db.save_app_config(&self.config) {
             Ok(()) => {}
-            Err(err) => self.status = format!("Failed to save config: {err}"),
+            Err(err) => self.status = format!("Failed to save settings: {err}"),
         }
+    }
+
+    fn commit_scan_filters(&mut self) {
+        let extensions = normalized_extension_filter_text(&self.indexed_extensions_input);
+        let Ok(min_size_bytes) = self.min_index_size_bytes_input.trim().parse::<u64>() else {
+            return;
+        };
+
+        self.config.index_all_extensions = self.index_all_extensions;
+        self.config.indexed_extensions = if extensions.is_empty() {
+            default_indexed_extensions()
+        } else {
+            extensions
+        };
+        self.config.min_index_size_bytes = min_size_bytes;
+        self.indexed_extensions_input = self.config.indexed_extensions.clone();
+        self.min_index_size_bytes_input = self.config.min_index_size_bytes.to_string();
+        self.save_config();
     }
 
     fn commit_ffmpeg_preview_settings(&mut self) {
@@ -786,11 +818,20 @@ impl FileIndexerApp {
             return;
         }
 
+        self.commit_scan_filters();
         let selected_roots = self.config.selected_roots.clone();
         if selected_roots.is_empty() {
             self.status = "Select at least one drive before scanning".to_string();
             return;
         }
+        let scan_filter = ScanFilter {
+            extensions: if self.config.index_all_extensions {
+                Default::default()
+            } else {
+                parse_extension_filter(&self.config.indexed_extensions)
+            },
+            min_size_bytes: self.config.min_index_size_bytes,
+        };
 
         self.save_config();
         let db_path = match database_path() {
@@ -811,7 +852,7 @@ impl FileIndexerApp {
         thread::spawn(move || {
             let result = (|| -> Result<ScanStats> {
                 let (records, stats) =
-                    scanner::scan_roots(&selected_roots, |root, indexed_files| {
+                    scanner::scan_roots(&selected_roots, &scan_filter, |root, indexed_files| {
                         let _ = sender.send(ScanMessage::Progress {
                             root: root.to_string(),
                             indexed_files,
@@ -1532,25 +1573,17 @@ impl eframe::App for FileIndexerApp {
                                     .show(ui, |ui| {
                                         ui.set_min_width(ui.available_width());
                                         ui.vertical(|ui| {
-                                            ui.horizontal(|ui| {
-                                                if ui
-                                                    .link(
-                                                        RichText::new(&result.filename)
-                                                            .size(H3_SIZE)
-                                                            .strong()
-                                                            .color(ui.visuals().hyperlink_color),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    let _ = open_with_registered_app(&result.full_path);
-                                                }
-                                                if !result.extension.is_empty() {
-                                                    ui.label(
-                                                        RichText::new(format!(".{}", result.extension))
-                                                            .color(Color32::from_rgb(140, 186, 222)),
-                                                    );
-                                                }
-                                            });
+                                            if ui
+                                                .link(
+                                                    RichText::new(&result.filename)
+                                                        .size(H3_SIZE)
+                                                        .strong()
+                                                        .color(ui.visuals().hyperlink_color),
+                                                )
+                                                .clicked()
+                                            {
+                                                let _ = open_with_registered_app(&result.full_path);
+                                            }
                                             ui.small(
                                                 RichText::new(result.full_path.as_str())
                                                     .size(SMALL_SIZE)
@@ -1647,6 +1680,71 @@ impl eframe::App for FileIndexerApp {
                             RichText::new("Choose which drives are indexed, then rebuild when needed.")
                                 .size(BODY_SIZE)
                                 .color(Color32::from_rgb(220, 229, 236)),
+                        );
+                        ui.add_space(8.0);
+
+                        let mut extensions_response = None;
+                        let mut min_size_response = None;
+                        if ui
+                            .checkbox(
+                                &mut self.index_all_extensions,
+                                RichText::new("All extensions")
+                                    .color(Color32::from_rgb(232, 239, 244)),
+                            )
+                            .changed()
+                        {
+                            self.commit_scan_filters();
+                        }
+                        ui.add_space(6.0);
+                        egui::Grid::new("drives_filter_grid")
+                            .num_columns(2)
+                            .spacing(egui::vec2(12.0, 8.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("Extensions")
+                                        .size(SMALL_SIZE)
+                                        .color(Color32::from_rgb(176, 192, 203)),
+                                );
+                                extensions_response = Some(ui.add_enabled(
+                                    !self.index_all_extensions,
+                                    egui::TextEdit::singleline(&mut self.indexed_extensions_input)
+                                        .hint_text("mp4 jpg png webm ..."),
+                                ));
+                                ui.end_row();
+
+                                ui.label(
+                                    RichText::new("Min size (bytes)")
+                                        .size(SMALL_SIZE)
+                                        .color(Color32::from_rgb(176, 192, 203)),
+                                );
+                                min_size_response = Some(ui.add_sized(
+                                    [140.0, 24.0],
+                                    egui::TextEdit::singleline(
+                                        &mut self.min_index_size_bytes_input,
+                                    ),
+                                ));
+                                ui.end_row();
+                            });
+
+                        if let (Some(extensions_response), Some(min_size_response)) =
+                            (extensions_response, min_size_response)
+                        {
+                            let enter_pressed =
+                                ui.input(|input| input.key_pressed(egui::Key::Enter));
+                            let commit_requested = extensions_response.lost_focus()
+                                || min_size_response.lost_focus()
+                                || (enter_pressed
+                                    && (extensions_response.has_focus()
+                                        || min_size_response.has_focus()));
+                            if commit_requested {
+                                self.commit_scan_filters();
+                            }
+                        }
+
+                        ui.small(
+                            RichText::new("Space-separated multimedia extensions. Turn on 'All extensions' to index everything.")
+                                .size(SMALL_SIZE - 1.0)
+                                .color(Color32::from_rgb(150, 170, 184)),
                         );
                         ui.add_space(8.0);
 
@@ -2024,6 +2122,24 @@ impl IfEmptyThen for String {
             self
         }
     }
+}
+
+fn normalized_extension_filter_text(raw: &str) -> String {
+    let mut extensions = raw
+        .split_whitespace()
+        .map(|item| item.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    extensions.sort();
+    extensions.dedup();
+    extensions.join(" ")
+}
+
+fn parse_extension_filter(raw: &str) -> std::collections::HashSet<String> {
+    raw.split_whitespace()
+        .map(|item| item.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 fn tab_title(id: usize, query: &str) -> String {

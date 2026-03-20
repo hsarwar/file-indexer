@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use walkdir::WalkDir;
 
@@ -10,7 +10,17 @@ pub struct ScanStats {
     pub skipped_entries: usize,
 }
 
-pub fn scan_roots<F>(roots: &[String], mut progress: F) -> (Vec<FileRecord>, ScanStats)
+#[derive(Debug, Clone)]
+pub struct ScanFilter {
+    pub extensions: HashSet<String>,
+    pub min_size_bytes: u64,
+}
+
+pub fn scan_roots<F>(
+    roots: &[String],
+    filter: &ScanFilter,
+    mut progress: F,
+) -> (Vec<FileRecord>, ScanStats)
 where
     F: FnMut(&str, usize),
 {
@@ -28,6 +38,23 @@ where
 
                     match entry.metadata() {
                         Ok(metadata) => {
+                            if metadata.len() < filter.min_size_bytes {
+                                stats.skipped_entries += 1;
+                                continue;
+                            }
+
+                            let extension = entry
+                                .path()
+                                .extension()
+                                .and_then(|value| value.to_str())
+                                .map(|value| value.to_ascii_lowercase())
+                                .unwrap_or_default();
+                            if !filter.extensions.is_empty() && !filter.extensions.contains(&extension)
+                            {
+                                stats.skipped_entries += 1;
+                                continue;
+                            }
+
                             if let Some(record) = build_record(root, entry.path(), &metadata) {
                                 records.push(record);
                                 stats.indexed_files += 1;

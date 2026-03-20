@@ -6,8 +6,12 @@ use std::{
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
+use serde::{Serialize, de::DeserializeOwned};
 
-use crate::config::{SortDirection, SortField};
+use crate::config::{
+    AppConfig, DEFAULT_MIN_INDEX_SIZE_BYTES, FavoriteSearch, SortDirection, SortField,
+    available_roots, default_indexed_extensions,
+};
 
 #[derive(Debug, Clone)]
 pub struct FileRecord {
@@ -116,6 +120,8 @@ impl IndexStore {
         }
 
         tx.commit()?;
+        // Repeated full rebuilds would otherwise leave the DB and WAL files bloated on disk.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
         Ok(())
     }
 
@@ -301,6 +307,86 @@ impl IndexStore {
         Ok(normalized)
     }
 
+    pub fn load_app_config(&self, legacy: Option<&AppConfig>) -> Result<AppConfig> {
+        let conn = self.open()?;
+        let defaults = AppConfig::default();
+
+        let selected_roots = match load_optional_setting_json::<Vec<String>>(
+            &conn,
+            "selected_roots",
+        )? {
+            Some(value) => value,
+            None => legacy
+                .map(|config| config.selected_roots.clone())
+                .unwrap_or_else(available_roots),
+        };
+        let favorites = match load_optional_setting_json::<Vec<FavoriteSearch>>(
+            &conn,
+            "favorites",
+        )? {
+            Some(value) => value,
+            None => legacy
+                .map(|config| config.favorites.clone())
+                .unwrap_or_default(),
+        };
+        let index_all_extensions = match load_optional_setting_bool(
+            &conn,
+            "index_all_extensions",
+        )? {
+            Some(value) => value,
+            None => legacy
+                .map(|config| config.index_all_extensions)
+                .unwrap_or(defaults.index_all_extensions),
+        };
+        let indexed_extensions = match load_optional_setting_string(
+            &conn,
+            "indexed_extensions",
+        )? {
+            Some(value) if !value.trim().is_empty() => value,
+            _ => legacy
+                .map(|config| config.indexed_extensions.clone())
+                .unwrap_or_else(default_indexed_extensions),
+        };
+        let min_index_size_bytes = match load_optional_setting_u64(
+            &conn,
+            "min_index_size_bytes",
+        )? {
+            Some(value) => value,
+            None => legacy
+                .map(|config| config.min_index_size_bytes)
+                .unwrap_or(DEFAULT_MIN_INDEX_SIZE_BYTES),
+        };
+
+        let config = AppConfig {
+            selected_roots,
+            favorites,
+            index_all_extensions,
+            indexed_extensions,
+            min_index_size_bytes,
+        };
+
+        self.save_app_config(&config)?;
+        Ok(config)
+    }
+
+    pub fn save_app_config(&self, config: &AppConfig) -> Result<()> {
+        let conn = self.open()?;
+        save_setting_json(&conn, "selected_roots", &config.selected_roots)?;
+        save_setting_json(&conn, "favorites", &config.favorites)?;
+        save_setting_string(
+            &conn,
+            "index_all_extensions",
+            if config.index_all_extensions { "1" } else { "0" },
+        )?;
+        save_setting_string(&conn, "indexed_extensions", &config.indexed_extensions)?;
+        save_setting_string(
+            &conn,
+            "min_index_size_bytes",
+            &config.min_index_size_bytes.to_string(),
+        )?;
+        Ok(())
+    }
+
     fn initialize(&self) -> Result<()> {
         if let Some(parent) = self.db_path.parent() {
             std::fs::create_dir_all(parent)
@@ -415,16 +501,61 @@ fn load_setting_usize(
 }
 
 fn load_optional_setting_u32(conn: &Connection, key: &str) -> Result<Option<u32>> {
+    Ok(load_optional_setting_string(conn, key)?
+        .and_then(|raw| raw.parse::<u32>().ok()))
+}
+
+fn load_optional_setting_u64(conn: &Connection, key: &str) -> Result<Option<u64>> {
+    Ok(load_optional_setting_string(conn, key)?
+        .and_then(|raw| raw.parse::<u64>().ok()))
+}
+
+fn load_optional_setting_bool(conn: &Connection, key: &str) -> Result<Option<bool>> {
+    Ok(load_optional_setting_string(conn, key)?.and_then(|raw| match raw.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        value if value.eq_ignore_ascii_case("true") => Some(true),
+        value if value.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }))
+}
+
+fn load_optional_setting_json<T>(conn: &Connection, key: &str) -> Result<Option<T>>
+where
+    T: DeserializeOwned,
+{
+    Ok(load_optional_setting_string(conn, key)?
+        .and_then(|raw| serde_json::from_str::<T>(&raw).ok()))
+}
+
+fn load_optional_setting_string(conn: &Connection, key: &str) -> Result<Option<String>> {
     let value = conn.query_row(
         "SELECT value FROM app_settings WHERE key = ?1",
         [key],
         |row| row.get::<_, String>(0),
     );
     match value {
-        Ok(raw) => Ok(raw.parse::<u32>().ok()),
+        Ok(raw) => Ok(Some(raw)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(err) => return Err(err.into()),
+        Err(err) => Err(err.into()),
     }
+}
+
+fn save_setting_json<T>(conn: &Connection, key: &str, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    save_setting_string(conn, key, &serde_json::to_string(value)?)
+}
+
+fn save_setting_string(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO app_settings (key, value)
+         VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
 }
 
 fn order_clause(sort_field: &SortField, sort_direction: &SortDirection) -> String {
