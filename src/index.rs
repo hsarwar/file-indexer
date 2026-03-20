@@ -15,6 +15,7 @@ pub struct FileRecord {
     pub full_path: String,
     pub filename: String,
     pub normalized_filename: String,
+    pub normalized_full_path: String,
     pub extension: String,
     pub modified_unix_secs: i64,
     pub size_bytes: i64,
@@ -42,6 +43,12 @@ pub struct RootScanInfo {
     pub root_path: String,
     pub last_scan_unix_secs: i64,
     pub file_count: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FfmpegPreviewSettings {
+    pub thumbnail_count: usize,
+    pub interval_seconds: u32,
 }
 
 pub struct IndexStore {
@@ -79,10 +86,11 @@ impl IndexStore {
                     full_path,
                     filename,
                     normalized_filename,
+                    normalized_full_path,
                     extension,
                     modified_unix_secs,
                     size_bytes
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
 
             let mut trigram_stmt =
@@ -94,6 +102,7 @@ impl IndexStore {
                     record.full_path,
                     record.filename,
                     record.normalized_filename,
+                    record.normalized_full_path,
                     record.extension,
                     record.modified_unix_secs,
                     record.size_bytes
@@ -230,6 +239,68 @@ impl IndexStore {
             .map_err(Into::into)
     }
 
+    pub fn load_ffmpeg_preview_settings(&self) -> Result<FfmpegPreviewSettings> {
+        let conn = self.open()?;
+        let thumbnail_count = load_setting_usize(
+            &conn,
+            "ffmpeg_preview_thumbnail_count",
+            15,
+            1,
+            60,
+        )?;
+        let interval_seconds = match load_optional_setting_u32(
+            &conn,
+            "ffmpeg_preview_interval_seconds",
+        )? {
+            Some(value) => value.clamp(1, 3600),
+            None => {
+                let migrated_minutes = load_optional_setting_u32(
+                    &conn,
+                    "ffmpeg_preview_interval_minutes",
+                )?;
+                migrated_minutes.map(|value| value.saturating_mul(60)).unwrap_or(120)
+            }
+        };
+        Ok(FfmpegPreviewSettings {
+            thumbnail_count,
+            interval_seconds,
+        })
+    }
+
+    pub fn save_ffmpeg_preview_settings(
+        &self,
+        settings: FfmpegPreviewSettings,
+    ) -> Result<FfmpegPreviewSettings> {
+        let normalized = FfmpegPreviewSettings {
+            thumbnail_count: settings.thumbnail_count.clamp(1, 60),
+            interval_seconds: settings.interval_seconds.clamp(1, 3600),
+        };
+        let conn = self.open()?;
+        conn.execute(
+            "INSERT INTO app_settings (key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![
+                "ffmpeg_preview_thumbnail_count",
+                normalized.thumbnail_count.to_string()
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO app_settings (key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![
+                "ffmpeg_preview_interval_seconds",
+                normalized.interval_seconds.to_string()
+            ],
+        )?;
+        conn.execute(
+            "DELETE FROM app_settings WHERE key = ?1",
+            ["ffmpeg_preview_interval_minutes"],
+        )?;
+        Ok(normalized)
+    }
+
     fn initialize(&self) -> Result<()> {
         if let Some(parent) = self.db_path.parent() {
             std::fs::create_dir_all(parent)
@@ -247,6 +318,7 @@ impl IndexStore {
                 full_path TEXT NOT NULL UNIQUE,
                 filename TEXT NOT NULL,
                 normalized_filename TEXT NOT NULL,
+                normalized_full_path TEXT NOT NULL DEFAULT '',
                 extension TEXT NOT NULL,
                 modified_unix_secs INTEGER NOT NULL,
                 size_bytes INTEGER NOT NULL
@@ -262,11 +334,16 @@ impl IndexStore {
                 ON file_trigrams(trigram);
             CREATE INDEX IF NOT EXISTS idx_file_trigrams_file_id
                 ON file_trigrams(file_id);
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS roots (
                 root_path TEXT PRIMARY KEY,
                 last_scan_unix_secs INTEGER NOT NULL
             );",
         )?;
+        ensure_files_schema(&conn)?;
         Ok(())
     }
 
@@ -296,7 +373,7 @@ fn search_where_clause(expression: &[Vec<String>]) -> String {
         .iter()
         .map(|group| {
             let and_clause = (0..group.len())
-                .map(|_| "normalized_filename LIKE ?")
+                .map(|_| "(normalized_filename LIKE ? OR normalized_full_path LIKE ?)")
                 .collect::<Vec<_>>()
                 .join(" AND ");
             format!("({and_clause})")
@@ -309,10 +386,45 @@ fn search_params(expression: &[Vec<String>]) -> Vec<rusqlite::types::Value> {
     let mut values = Vec::new();
     for group in expression {
         for term in group {
-            values.push(format!("%{term}%").into());
+            let value = format!("%{term}%");
+            values.push(value.clone().into());
+            values.push(value.into());
         }
     }
     values
+}
+
+fn load_setting_usize(
+    conn: &Connection,
+    key: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize> {
+    let value = conn.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        [key],
+        |row| row.get::<_, String>(0),
+    );
+    let parsed = match value {
+        Ok(raw) => raw.parse::<usize>().ok(),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(err) => return Err(err.into()),
+    };
+    Ok(parsed.unwrap_or(default).clamp(min, max))
+}
+
+fn load_optional_setting_u32(conn: &Connection, key: &str) -> Result<Option<u32>> {
+    let value = conn.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        [key],
+        |row| row.get::<_, String>(0),
+    );
+    match value {
+        Ok(raw) => Ok(raw.parse::<u32>().ok()),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(err) => return Err(err.into()),
+    }
 }
 
 fn order_clause(sort_field: &SortField, sort_direction: &SortDirection) -> String {
@@ -364,6 +476,7 @@ pub fn build_record(
         full_path: full_path.to_string_lossy().to_string(),
         filename,
         normalized_filename,
+        normalized_full_path: normalize(&full_path.to_string_lossy()),
         extension,
         modified_unix_secs,
         size_bytes: metadata.len().try_into().ok()?,
@@ -398,4 +511,29 @@ fn system_time_to_unix_secs(time: SystemTime) -> Option<i64> {
 
 fn now_unix_secs() -> i64 {
     system_time_to_unix_secs(SystemTime::now()).unwrap_or_default()
+}
+
+fn ensure_files_schema(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(files)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if !columns.iter().any(|column| column == "normalized_full_path") {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN normalized_full_path TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE files SET normalized_full_path = LOWER(full_path) WHERE normalized_full_path = ''",
+            [],
+        )?;
+    }
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_files_normalized_full_path ON files(normalized_full_path)",
+        [],
+    )?;
+
+    Ok(())
 }

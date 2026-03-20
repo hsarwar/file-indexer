@@ -23,7 +23,7 @@ use config::{
 };
 use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke, Vec2};
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader, RgbaImage};
-use index::{IndexStore, RootScanInfo, SearchResult};
+use index::{FfmpegPreviewSettings, IndexStore, RootScanInfo, SearchResult};
 use windows::{
     Win32::{
         Foundation::{RECT, SIZE},
@@ -54,8 +54,8 @@ const MIN_WINDOW_WIDTH: f32 = 1280.0;
 const MIN_WINDOW_HEIGHT: f32 = 800.0;
 const DEFAULT_WINDOW_WIDTH: f32 = 1440.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 900.0;
-const FFMPEG_PREVIEW_FRAME_COUNT: usize = 10;
-const FFMPEG_PREVIEW_INTERVAL_SECS: u32 = 120;
+const DEFAULT_FFMPEG_PREVIEW_FRAME_COUNT: usize = 15;
+const DEFAULT_FFMPEG_PREVIEW_INTERVAL_SECONDS: u32 = 120;
 
 
 fn primary_work_area_viewport() -> Option<([f32; 2], [f32; 2])> {
@@ -307,7 +307,11 @@ struct FileIndexerApp {
     favorites_popup_open: bool,
     favorites_filter: String,
     drives_popup_open: bool,
+    options_popup_open: bool,
     video_preview_backend: VideoPreviewBackend,
+    ffmpeg_preview_settings: FfmpegPreviewSettings,
+    ffmpeg_thumbnail_count_input: String,
+    ffmpeg_interval_seconds_input: String,
     preview: PreviewState,
 }
 
@@ -371,6 +375,12 @@ impl FileIndexerApp {
         let db_path = database_path()?;
         let db_path_label = db_path.display().to_string();
         let db = IndexStore::new(db_path)?;
+        let ffmpeg_preview_settings = db
+            .load_ffmpeg_preview_settings()
+            .unwrap_or(FfmpegPreviewSettings {
+                thumbnail_count: DEFAULT_FFMPEG_PREVIEW_FRAME_COUNT,
+                interval_seconds: DEFAULT_FFMPEG_PREVIEW_INTERVAL_SECONDS,
+            });
         let total_files = db.total_files().unwrap_or_default();
         let last_scan_label = format_last_scan(db.last_scan_unix_secs().ok().flatten());
         let root_scan_info = map_root_scan_info(db.root_scan_info().unwrap_or_default());
@@ -391,7 +401,11 @@ impl FileIndexerApp {
             favorites_popup_open: false,
             favorites_filter: String::new(),
             drives_popup_open: false,
+            options_popup_open: false,
             video_preview_backend: VideoPreviewBackend::WindowsShell,
+            ffmpeg_thumbnail_count_input: ffmpeg_preview_settings.thumbnail_count.to_string(),
+            ffmpeg_interval_seconds_input: ffmpeg_preview_settings.interval_seconds.to_string(),
+            ffmpeg_preview_settings,
             preview: PreviewState::default(),
         })
     }
@@ -449,10 +463,16 @@ impl FileIndexerApp {
         let path = result.full_path.clone();
         let extension = result.extension.to_lowercase();
         let video_preview_backend = self.video_preview_backend;
+        let ffmpeg_preview_settings = self.ffmpeg_preview_settings;
         thread::spawn(move || {
             let preview_started_at = Instant::now();
             log_preview_timing(&path, "preview worker start", preview_started_at.elapsed());
-            let message = match load_preview_bytes(&path, &extension, video_preview_backend) {
+            let message = match load_preview_bytes(
+                &path,
+                &extension,
+                video_preview_backend,
+                ffmpeg_preview_settings,
+            ) {
                 Ok(frames) => PreviewLoadResult {
                     path: path.clone(),
                     frames,
@@ -665,6 +685,36 @@ impl FileIndexerApp {
         match config_path().and_then(|path| self.config.save(&path)) {
             Ok(()) => {}
             Err(err) => self.status = format!("Failed to save config: {err}"),
+        }
+    }
+
+    fn commit_ffmpeg_preview_settings(&mut self) {
+        let parsed_count = self.ffmpeg_thumbnail_count_input.trim().parse::<usize>();
+        let parsed_interval = self.ffmpeg_interval_seconds_input.trim().parse::<u32>();
+        let (Ok(thumbnail_count), Ok(interval_seconds)) = (parsed_count, parsed_interval) else {
+            return;
+        };
+
+        let requested = FfmpegPreviewSettings {
+            thumbnail_count,
+            interval_seconds,
+        };
+        let Ok(normalized) = self.db.save_ffmpeg_preview_settings(requested) else {
+            self.status = "Failed to save FFmpeg preview settings".to_string();
+            return;
+        };
+
+        let changed = normalized.thumbnail_count != self.ffmpeg_preview_settings.thumbnail_count
+            || normalized.interval_seconds != self.ffmpeg_preview_settings.interval_seconds;
+        self.ffmpeg_preview_settings = normalized;
+        self.ffmpeg_thumbnail_count_input = normalized.thumbnail_count.to_string();
+        self.ffmpeg_interval_seconds_input = normalized.interval_seconds.to_string();
+
+        if changed
+            && is_video_extension(&self.preview.selected_extension)
+            && self.video_preview_backend == VideoPreviewBackend::Ffmpeg
+        {
+            self.rerender_selected_preview();
         }
     }
 
@@ -924,6 +974,24 @@ impl eframe::App for FileIndexerApp {
                                 if ui
                                     .add(
                                         egui::Button::new(
+                                            RichText::new("Options")
+                                                .size(BODY_SIZE)
+                                                .strong()
+                                                .color(Color32::from_rgb(242, 245, 247)),
+                                        )
+                                        .min_size(egui::vec2(104.0, 34.0))
+                                        .fill(Color32::from_rgb(44, 98, 86))
+                                        .stroke(Stroke::new(1.0, Color32::from_rgb(82, 144, 129))),
+                                    )
+                                    .clicked()
+                                {
+                                    self.options_popup_open = true;
+                                }
+
+                                ui.add_space(10.0);
+                                if ui
+                                    .add(
+                                        egui::Button::new(
                                             RichText::new("Drives")
                                                 .size(BODY_SIZE)
                                                 .strong()
@@ -1016,15 +1084,6 @@ impl eframe::App for FileIndexerApp {
                 let preview_is_video = is_video_extension(&self.preview.selected_extension);
                 if preview_is_video && self.video_preview_backend != previous_backend {
                     self.rerender_selected_preview();
-                }
-                if preview_is_video && self.video_preview_backend == VideoPreviewBackend::Ffmpeg {
-                    ui.small(
-                        RichText::new(
-                            "Extracting 10 thumbnails at 0s, then every 2 minutes, without ffprobe",
-                        )
-                        .size(SMALL_SIZE)
-                        .color(Color32::from_rgb(176, 192, 203)),
-                    );
                 }
                 ui.add_space(6.0);
 
@@ -1226,96 +1285,163 @@ impl eframe::App for FileIndexerApp {
                     .stroke(Stroke::new(1.0, Color32::from_rgb(46, 62, 74)))
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("Search")
-                                    .strong()
-                                    .color(Color32::from_rgb(236, 241, 244)),
-                            );
-                            let response = ui.add_sized(
-                                [ui.available_width() - 10.0, 28.0],
-                                egui::TextEdit::singleline(&mut self.tabs[active_index].query)
-                                    .hint_text("Filename search: mp4 && ytd_ || trailer"),
-                            );
-                            if response.changed() {
-                                self.tabs[active_index].page = 0;
-                                self.tabs[active_index].title = tab_title(
-                                    self.tabs[active_index].id,
-                                    &self.tabs[active_index].query,
+                        egui::Grid::new("search_controls_grid")
+                            .num_columns(2)
+                            .spacing(egui::vec2(10.0, 10.0))
+                            .show(ui, |ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(56.0, 32.0),
+                                    egui::Layout::centered_and_justified(
+                                        egui::Direction::LeftToRight,
+                                    ),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new("Search")
+                                                .strong()
+                                                .color(Color32::from_rgb(236, 241, 244)),
+                                        );
+                                    },
                                 );
-                                search_changed = true;
-                            }
-                        });
-
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("Sort")
-                                    .strong()
-                                    .color(Color32::from_rgb(236, 241, 244)),
-                            );
-
-                            ui.scope(|ui| {
-                                let visuals = ui.visuals_mut();
-                                visuals.override_text_color = Some(Color32::from_rgb(236, 241, 244));
-                                visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(27, 39, 49);
-                                visuals.widgets.inactive.bg_fill = Color32::from_rgb(27, 39, 49);
-                                visuals.widgets.inactive.fg_stroke =
-                                    Stroke::new(1.4, Color32::from_rgb(236, 241, 244));
-                                visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(40, 52, 64);
-                                visuals.widgets.hovered.bg_fill = Color32::from_rgb(40, 52, 64);
-                                visuals.widgets.hovered.fg_stroke =
-                                    Stroke::new(1.4, Color32::from_rgb(248, 250, 252));
-                                visuals.widgets.active.fg_stroke =
-                                    Stroke::new(1.4, Color32::from_rgb(250, 251, 252));
-                                visuals.widgets.open.fg_stroke =
-                                    Stroke::new(1.4, Color32::from_rgb(248, 250, 252));
-
-                                let mut sort_field = self.tabs[active_index].sort_field.clone();
-                                egui::ComboBox::from_id_salt("sort_field")
-                                    .selected_text(
-                                        RichText::new(sort_field_label(&sort_field))
-                                            .color(Color32::from_rgb(236, 241, 244)),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut sort_field, SortField::Name, "Name");
-                                        ui.selectable_value(
-                                            &mut sort_field,
-                                            SortField::Modified,
-                                            "Date",
-                                        );
-                                        ui.selectable_value(&mut sort_field, SortField::Size, "Size");
-                                    });
-
-                                let mut sort_direction = self.tabs[active_index].sort_direction.clone();
-                                egui::ComboBox::from_id_salt("sort_direction")
-                                    .selected_text(
-                                        RichText::new(sort_direction_label(&sort_direction))
-                                            .color(Color32::from_rgb(236, 241, 244)),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut sort_direction,
-                                            SortDirection::Asc,
-                                            "Ascending",
-                                        );
-                                        ui.selectable_value(
-                                            &mut sort_direction,
-                                            SortDirection::Desc,
-                                            "Descending",
-                                        );
-                                    });
-
-                                if sort_field != self.tabs[active_index].sort_field
-                                    || sort_direction != self.tabs[active_index].sort_direction
-                                {
-                                    self.tabs[active_index].sort_field = sort_field;
-                                    self.tabs[active_index].sort_direction = sort_direction;
+                                let response = ui.add_sized(
+                                    [ui.available_width(), 32.0],
+                                    egui::TextEdit::singleline(&mut self.tabs[active_index].query)
+                                        .hint_text("Name or folder search: mp4 && ytd_ || trailer"),
+                                );
+                                if response.changed() {
                                     self.tabs[active_index].page = 0;
+                                    self.tabs[active_index].title = tab_title(
+                                        self.tabs[active_index].id,
+                                        &self.tabs[active_index].query,
+                                    );
                                     search_changed = true;
                                 }
-                            });
+                                ui.end_row();
 
-                        });
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(56.0, 32.0),
+                                    egui::Layout::centered_and_justified(
+                                        egui::Direction::LeftToRight,
+                                    ),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new("Sort")
+                                                .strong()
+                                                .color(Color32::from_rgb(236, 241, 244)),
+                                        );
+                                    },
+                                );
+                                ui.scope(|ui| {
+                                    let visuals = ui.visuals_mut();
+                                    visuals.override_text_color =
+                                        Some(Color32::from_rgb(236, 241, 244));
+                                    visuals.widgets.inactive.weak_bg_fill =
+                                        Color32::from_rgb(27, 39, 49);
+                                    visuals.widgets.inactive.bg_fill =
+                                        Color32::from_rgb(27, 39, 49);
+                                    visuals.widgets.inactive.fg_stroke =
+                                        Stroke::new(1.4, Color32::from_rgb(236, 241, 244));
+                                    visuals.widgets.hovered.weak_bg_fill =
+                                        Color32::from_rgb(40, 52, 64);
+                                    visuals.widgets.hovered.bg_fill =
+                                        Color32::from_rgb(40, 52, 64);
+                                    visuals.widgets.hovered.fg_stroke =
+                                        Stroke::new(1.4, Color32::from_rgb(248, 250, 252));
+                                    visuals.widgets.active.fg_stroke =
+                                        Stroke::new(1.4, Color32::from_rgb(250, 251, 252));
+                                    visuals.widgets.open.fg_stroke =
+                                        Stroke::new(1.4, Color32::from_rgb(248, 250, 252));
+
+                                    let mut sort_field =
+                                        self.tabs[active_index].sort_field.clone();
+                                    let mut sort_direction =
+                                        self.tabs[active_index].sort_direction.clone();
+                                    let spacing = ui.spacing().item_spacing.x;
+                                    let (row_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), 32.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    let sort_field_rect =
+                                        egui::Rect::from_min_size(row_rect.min, egui::vec2(132.0, 32.0));
+                                    let sort_direction_rect = egui::Rect::from_min_size(
+                                        egui::pos2(sort_field_rect.max.x + spacing, row_rect.min.y),
+                                        egui::vec2(124.0, 32.0),
+                                    );
+
+                                    ui.scope_builder(
+                                        egui::UiBuilder::new()
+                                            .max_rect(sort_field_rect)
+                                            .layout(egui::Layout::centered_and_justified(
+                                                egui::Direction::LeftToRight,
+                                            )),
+                                        |ui| {
+                                            egui::ComboBox::from_id_salt("sort_field")
+                                                .width(132.0)
+                                                .selected_text(
+                                                    RichText::new(sort_field_label(&sort_field))
+                                                        .color(Color32::from_rgb(236, 241, 244)),
+                                                )
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(
+                                                        &mut sort_field,
+                                                        SortField::Name,
+                                                        "Name",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut sort_field,
+                                                        SortField::Modified,
+                                                        "Date",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut sort_field,
+                                                        SortField::Size,
+                                                        "Size",
+                                                    );
+                                                });
+                                        },
+                                    );
+
+                                    ui.scope_builder(
+                                        egui::UiBuilder::new()
+                                            .max_rect(sort_direction_rect)
+                                            .layout(egui::Layout::centered_and_justified(
+                                                egui::Direction::LeftToRight,
+                                            )),
+                                        |ui| {
+                                            egui::ComboBox::from_id_salt("sort_direction")
+                                                .width(124.0)
+                                                .selected_text(
+                                                    RichText::new(sort_direction_label(
+                                                        &sort_direction,
+                                                    ))
+                                                    .color(Color32::from_rgb(236, 241, 244)),
+                                                )
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(
+                                                        &mut sort_direction,
+                                                        SortDirection::Asc,
+                                                        "Ascending",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut sort_direction,
+                                                        SortDirection::Desc,
+                                                        "Descending",
+                                                    );
+                                                });
+                                        },
+                                    );
+
+                                    if sort_field != self.tabs[active_index].sort_field
+                                        || sort_direction
+                                            != self.tabs[active_index].sort_direction
+                                    {
+                                        self.tabs[active_index].sort_field = sort_field;
+                                        self.tabs[active_index].sort_direction = sort_direction;
+                                        self.tabs[active_index].page = 0;
+                                        search_changed = true;
+                                    }
+                                });
+                                ui.end_row();
+                            });
                     });
 
                 if search_changed {
@@ -1626,6 +1752,103 @@ impl eframe::App for FileIndexerApp {
             self.drives_popup_open = popup_open;
         }
 
+        if self.options_popup_open {
+            let mut popup_open = self.options_popup_open;
+            egui::Window::new("Options")
+                .open(&mut popup_open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(420.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(24, 32, 40))
+                        .corner_radius(CornerRadius::same(12))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(50, 64, 76)))
+                        .inner_margin(egui::Margin::same(12)),
+                )
+                .show(ctx, |ui| {
+                    ui.scope(|ui| {
+                        let visuals = ui.visuals_mut();
+                        visuals.override_text_color = Some(Color32::from_rgb(236, 241, 244));
+                        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(31, 40, 48);
+                        visuals.widgets.inactive.bg_fill = Color32::from_rgb(31, 40, 48);
+                        visuals.widgets.inactive.bg_stroke =
+                            Stroke::new(1.0, Color32::from_rgb(70, 88, 102));
+                        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(42, 54, 66);
+                        visuals.widgets.hovered.bg_fill = Color32::from_rgb(42, 54, 66);
+                        visuals.widgets.hovered.bg_stroke =
+                            Stroke::new(1.0, Color32::from_rgb(106, 128, 148));
+                        visuals.widgets.active.weak_bg_fill = Color32::from_rgb(57, 83, 106);
+                        visuals.widgets.active.bg_fill = Color32::from_rgb(57, 83, 106);
+                        visuals.widgets.active.bg_stroke =
+                            Stroke::new(1.0, Color32::from_rgb(132, 168, 198));
+
+                        ui.label(
+                            RichText::new("Options")
+                                .strong()
+                                .size(H2_SIZE)
+                                .color(Color32::from_rgb(242, 245, 247)),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("FFmpeg preview extraction")
+                                .size(BODY_SIZE)
+                                .color(Color32::from_rgb(220, 229, 236)),
+                        );
+                        ui.add_space(10.0);
+
+                        let mut thumbs_response = None;
+                        let mut interval_response = None;
+                        egui::Grid::new("options_ffmpeg_grid")
+                            .num_columns(2)
+                            .spacing(egui::vec2(12.0, 8.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("Max images")
+                                        .size(SMALL_SIZE - 1.0)
+                                        .color(Color32::from_rgb(176, 192, 203)),
+                                );
+                                thumbs_response = Some(ui.add_sized(
+                                    [56.0, 20.0],
+                                    egui::TextEdit::singleline(
+                                        &mut self.ffmpeg_thumbnail_count_input,
+                                    ),
+                                ));
+                                ui.end_row();
+
+                                ui.label(
+                                    RichText::new("Seconds between images")
+                                        .size(SMALL_SIZE - 1.0)
+                                        .color(Color32::from_rgb(176, 192, 203)),
+                                );
+                                interval_response = Some(ui.add_sized(
+                                    [64.0, 20.0],
+                                    egui::TextEdit::singleline(
+                                        &mut self.ffmpeg_interval_seconds_input,
+                                    ),
+                                ));
+                                ui.end_row();
+                            });
+
+                        if let (Some(thumbs_response), Some(interval_response)) =
+                            (thumbs_response, interval_response)
+                        {
+                            let enter_pressed =
+                                ui.input(|input| input.key_pressed(egui::Key::Enter));
+                            let commit_requested = thumbs_response.lost_focus()
+                                || interval_response.lost_focus()
+                                || (enter_pressed
+                                    && (thumbs_response.has_focus()
+                                        || interval_response.has_focus()));
+                            if commit_requested {
+                                self.commit_ffmpeg_preview_settings();
+                            }
+                        }
+                    });
+                });
+            self.options_popup_open = popup_open;
+        }
+
         if self.favorites_popup_open {
             let mut popup_open = self.favorites_popup_open;
             let filter = self.favorites_filter.to_lowercase();
@@ -1923,6 +2146,7 @@ fn load_preview_bytes(
     path: &str,
     extension: &str,
     video_preview_backend: VideoPreviewBackend,
+    ffmpeg_preview_settings: FfmpegPreviewSettings,
 ) -> Result<Vec<PreviewFrameBytes>> {
     if is_image_extension(extension) {
         let image = render_image_preview(path, extension)?;
@@ -1930,7 +2154,7 @@ fn load_preview_bytes(
     }
 
     if is_video_extension(extension) {
-        let frames = render_video_previews(path, video_preview_backend)?;
+        let frames = render_video_previews(path, video_preview_backend, ffmpeg_preview_settings)?;
         return Ok(frames);
     }
 
@@ -1956,6 +2180,7 @@ fn render_image_preview(path: &str, extension: &str) -> Result<Vec<u8>> {
 fn render_video_previews(
     path: &str,
     backend: VideoPreviewBackend,
+    ffmpeg_preview_settings: FfmpegPreviewSettings,
 ) -> Result<Vec<PreviewFrameBytes>> {
     match backend {
         VideoPreviewBackend::WindowsShell => {
@@ -1970,7 +2195,7 @@ fn render_video_previews(
             }
             fs::create_dir_all(&output_dir)?;
 
-            run_ffmpeg_preview_frames(&ffmpeg_path, path, &output_dir)?;
+            run_ffmpeg_preview_frames(&ffmpeg_path, path, &output_dir, ffmpeg_preview_settings)?;
 
             let read_started_at = Instant::now();
             log_preview_timing(path, "ffmpeg frame read start", read_started_at.elapsed());
@@ -2055,6 +2280,7 @@ fn run_ffmpeg_preview_frames(
     ffmpeg_path: &std::path::Path,
     path: &str,
     output_dir: &std::path::Path,
+    settings: FfmpegPreviewSettings,
 ) -> Result<()> {
     let ffmpeg_started_at = Instant::now();
     log_preview_timing(path, "ffmpeg extraction start", ffmpeg_started_at.elapsed());
@@ -2062,8 +2288,8 @@ fn run_ffmpeg_preview_frames(
     let mut command = Command::new(ffmpeg_path);
     command.arg("-y").arg("-loglevel").arg("error");
 
-    for index in 0..FFMPEG_PREVIEW_FRAME_COUNT {
-        let seek_secs = index as u32 * FFMPEG_PREVIEW_INTERVAL_SECS;
+    for index in 0..settings.thumbnail_count {
+        let seek_secs = index as u32 * settings.interval_seconds;
         let output_path = output_dir.join(format!("frame_{:02}.bmp", index + 1));
         command
             .arg("-ss")
