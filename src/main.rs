@@ -10,6 +10,7 @@ use std::{
     hash::{Hash, Hasher},
     io::Cursor,
     mem::size_of,
+    os::windows::process::CommandExt,
     os::windows::ffi::OsStrExt,
     process::Command,
     sync::mpsc::{self, Receiver},
@@ -57,6 +58,7 @@ const DEFAULT_WINDOW_WIDTH: f32 = 1440.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 900.0;
 const DEFAULT_FFMPEG_PREVIEW_FRAME_COUNT: usize = 15;
 const DEFAULT_FFMPEG_PREVIEW_INTERVAL_SECONDS: u32 = 120;
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 fn set_icon_pixel(
     rgba: &mut [u8],
@@ -2265,6 +2267,7 @@ fn run_ffmpeg_preview_frames(
     log_preview_timing(path, "ffmpeg extraction start", ffmpeg_started_at.elapsed());
 
     let mut command = Command::new(ffmpeg_path);
+    command.creation_flags(CREATE_NO_WINDOW);
     command.arg("-y").arg("-loglevel").arg("error");
 
     for index in 0..settings.thumbnail_count {
