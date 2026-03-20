@@ -18,4 +18,5 @@ windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gd
 
 [build-dependencies]
 ico = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
 winresource = "0.1"

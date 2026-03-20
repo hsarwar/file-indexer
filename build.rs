@@ -1,5 +1,7 @@
 use std::{env, fs::File, path::PathBuf};
 
+use image::imageops::FilterType;
+
 fn set_icon_pixel(
     rgba: &mut [u8],
     width: usize,
@@ -176,15 +178,38 @@ fn app_icon_rgba(width: usize, height: usize) -> Vec<u8> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if env::var("CARGO_CFG_WINDOWS").is_ok() {
-        let out_dir = PathBuf::from(env::var("OUT_DIR")?);
-        let icon_path = out_dir.join("file-indexer.ico");
-        let mut icon_dir = ico::IconDir::new(ico::ResourceType::Icon);
-        for size in [16_u32, 24, 32, 48, 64, 128, 256] {
-            let image = ico::IconImage::from_rgba_data(size, size, app_icon_rgba(size as usize, size as usize));
-            icon_dir.add_entry(ico::IconDirEntry::encode(&image)?);
-        }
-        let mut file = File::create(&icon_path)?;
-        icon_dir.write(&mut file)?;
+        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+        let ico_icon_path = manifest_dir.join("assets").join("icons").join("app.ico");
+        let png_icon_path = manifest_dir.join("assets").join("icons").join("175513.png");
+
+        let icon_path = if ico_icon_path.is_file() {
+            ico_icon_path
+        } else {
+            let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+            let generated_icon_path = out_dir.join("file-indexer.ico");
+            let mut icon_dir = ico::IconDir::new(ico::ResourceType::Icon);
+            if png_icon_path.is_file() {
+                let source = image::open(&png_icon_path)?.to_rgba8();
+                for size in [16_u32, 24, 32, 48, 64, 128, 256] {
+                    let resized =
+                        image::imageops::resize(&source, size, size, FilterType::Lanczos3);
+                    let image = ico::IconImage::from_rgba_data(size, size, resized.into_raw());
+                    icon_dir.add_entry(ico::IconDirEntry::encode(&image)?);
+                }
+            } else {
+                for size in [16_u32, 24, 32, 48, 64, 128, 256] {
+                    let image = ico::IconImage::from_rgba_data(
+                        size,
+                        size,
+                        app_icon_rgba(size as usize, size as usize),
+                    );
+                    icon_dir.add_entry(ico::IconDirEntry::encode(&image)?);
+                }
+            }
+            let mut file = File::create(&generated_icon_path)?;
+            icon_dir.write(&mut file)?;
+            generated_icon_path
+        };
 
         winresource::WindowsResource::new()
             .set_icon(icon_path.to_string_lossy().as_ref())
