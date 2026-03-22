@@ -15,8 +15,8 @@ File Indexer is a vibe coded Windows desktop app for indexing your drives and fi
 - Fast local filename indexing
 - Boolean filename search
 - Folder-path search
-- Image preview
-- Video preview with Windows shell or FFmpeg
+- Inline Windows thumbnails on search result cards
+- FFmpeg preview panel for selected images and videos
 - Result-card navigation with `Up` / `Down`
 - M3U export for current search results
 - Windows executable icon embedded into the app

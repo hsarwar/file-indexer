@@ -5,7 +5,7 @@ mod index;
 mod scanner;
 
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{HashMap, VecDeque, hash_map::DefaultHasher},
     env, ffi::c_void, fs,
     hash::{Hash, Hasher},
     io::Cursor,
@@ -13,7 +13,7 @@ use std::{
     os::windows::process::CommandExt,
     os::windows::ffi::OsStrExt,
     process::Command,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
     thread,
     time::Instant,
 };
@@ -25,7 +25,7 @@ use config::{
     database_path, default_indexed_extensions,
 };
 use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke, Vec2};
-use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader, RgbaImage};
+use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
 use index::{FfmpegPreviewSettings, IndexStore, RootScanInfo, SearchResult};
 use windows::{
     Win32::{
@@ -60,6 +60,11 @@ const DEFAULT_WINDOW_HEIGHT: f32 = 900.0;
 const DEFAULT_FFMPEG_PREVIEW_FRAME_COUNT: usize = 15;
 const DEFAULT_FFMPEG_PREVIEW_INTERVAL_SECONDS: u32 = 120;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const CARD_PREVIEW_WIDTH: f32 = 220.0;
+const CARD_PREVIEW_HEIGHT: f32 = 124.0;
+const RESULT_CARD_ROW_HEIGHT: f32 = 168.0;
+const MAX_CONCURRENT_CARD_PREVIEW_LOADS: usize = 2;
+const MAX_CARD_PREVIEW_UPLOADS_PER_FRAME: usize = 1;
 
 fn set_icon_pixel(
     rgba: &mut [u8],
@@ -237,6 +242,21 @@ fn app_icon_rgba(width: usize, height: usize) -> Vec<u8> {
 }
 
 fn app_icon() -> egui::IconData {
+    const APP_ICON_ICO: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/icons/app.ico"
+    ));
+
+    if let Ok(image) = image::load_from_memory_with_format(APP_ICON_ICO, ImageFormat::Ico) {
+        let rgba = image.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        return egui::IconData {
+            rgba: rgba.into_raw(),
+            width,
+            height,
+        };
+    }
+
     let width = 128;
     let height = 128;
     egui::IconData {
@@ -281,7 +301,6 @@ struct FileIndexerApp {
     favorites_filter: String,
     drives_popup_open: bool,
     options_popup_open: bool,
-    video_preview_backend: VideoPreviewBackend,
     ffmpeg_preview_settings: FfmpegPreviewSettings,
     ffmpeg_thumbnail_count_input: String,
     ffmpeg_interval_seconds_input: String,
@@ -289,7 +308,8 @@ struct FileIndexerApp {
     indexed_extensions_input: String,
     min_index_size_bytes_input: String,
     startup_maximize_delay_frames: u8,
-    preview: PreviewState,
+    selected_preview: SelectedPreviewState,
+    card_previews: CardPreviewState,
 }
 
 struct SearchTab {
@@ -322,14 +342,8 @@ struct PreviewLoadResult {
     error: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum VideoPreviewBackend {
-    Ffmpeg,
-    WindowsShell,
-}
-
 #[derive(Default)]
-struct PreviewState {
+struct SelectedPreviewState {
     selected_path: Option<String>,
     selected_extension: String,
     rendered_path: Option<String>,
@@ -337,6 +351,33 @@ struct PreviewState {
     error: Option<String>,
     loading: bool,
     receiver: Option<Receiver<PreviewLoadResult>>,
+}
+
+struct CardPreviewLoadResult {
+    path: String,
+    pixels: Option<CardPreviewPixels>,
+    error: Option<String>,
+}
+
+struct CardPreviewPixels {
+    size: [usize; 2],
+    rgba: Vec<u8>,
+}
+
+#[derive(Default)]
+struct CardPreviewEntry {
+    texture: Option<egui::TextureHandle>,
+    error: Option<String>,
+    loading: bool,
+    queued: bool,
+}
+
+struct CardPreviewState {
+    entries: HashMap<String, CardPreviewEntry>,
+    pending_paths: VecDeque<(String, String)>,
+    in_flight: usize,
+    sender: Sender<CardPreviewLoadResult>,
+    receiver: Receiver<CardPreviewLoadResult>,
 }
 
 enum ScanMessage {
@@ -368,6 +409,7 @@ impl FileIndexerApp {
         let total_files = db.total_files().unwrap_or_default();
         let last_scan_label = format_last_scan(db.last_scan_unix_secs().ok().flatten());
         let root_scan_info = map_root_scan_info(db.root_scan_info().unwrap_or_default());
+        let (card_preview_sender, card_preview_receiver) = mpsc::channel();
 
         Ok(Self {
             config,
@@ -386,7 +428,6 @@ impl FileIndexerApp {
             favorites_filter: String::new(),
             drives_popup_open: false,
             options_popup_open: false,
-            video_preview_backend: VideoPreviewBackend::WindowsShell,
             ffmpeg_thumbnail_count_input: ffmpeg_preview_settings.thumbnail_count.to_string(),
             ffmpeg_interval_seconds_input: ffmpeg_preview_settings.interval_seconds.to_string(),
             index_all_extensions,
@@ -394,7 +435,14 @@ impl FileIndexerApp {
             min_index_size_bytes_input,
             ffmpeg_preview_settings,
             startup_maximize_delay_frames: 8,
-            preview: PreviewState::default(),
+            selected_preview: SelectedPreviewState::default(),
+            card_previews: CardPreviewState {
+                entries: HashMap::new(),
+                pending_paths: VecDeque::new(),
+                in_flight: 0,
+                sender: card_preview_sender,
+                receiver: card_preview_receiver,
+            },
         })
     }
 
@@ -406,14 +454,14 @@ impl FileIndexerApp {
         &mut self.tabs[self.active_tab]
     }
 
-    fn move_result_selection(&mut self, step: isize) {
+    fn move_result_selection(&mut self, ctx: &egui::Context, step: isize) {
         let results = self.active_tab().results.clone();
         if results.is_empty() {
             return;
         }
 
         let selected_index = self
-            .preview
+            .selected_preview
             .selected_path
             .as_deref()
             .and_then(|selected_path| {
@@ -431,36 +479,32 @@ impl FileIndexerApp {
             None => results.len().saturating_sub(1),
         };
 
-        self.set_preview_target(&results[next_index]);
+        self.set_preview_target(ctx, &results[next_index]);
     }
 
-    fn set_preview_target(&mut self, result: &SearchResult) {
-        if self.preview.selected_path.as_deref() == Some(result.full_path.as_str()) {
+    fn set_preview_target(&mut self, ctx: &egui::Context, result: &SearchResult) {
+        if self.selected_preview.selected_path.as_deref() == Some(result.full_path.as_str()) {
             return;
         }
 
-        self.preview.selected_path = Some(result.full_path.clone());
-        self.preview.selected_extension = result.extension.to_lowercase();
-        self.preview.rendered_path = None;
-        self.preview.textures.clear();
-        self.preview.error = None;
-        self.preview.loading = true;
+        self.selected_preview.selected_path = Some(result.full_path.clone());
+        self.selected_preview.selected_extension = result.extension.to_lowercase();
+        self.selected_preview.rendered_path = None;
+        self.selected_preview.textures.clear();
+        self.selected_preview.error = None;
+        self.selected_preview.loading = true;
 
         let (sender, receiver) = mpsc::channel();
-        self.preview.receiver = Some(receiver);
+        self.selected_preview.receiver = Some(receiver);
         let path = result.full_path.clone();
         let extension = result.extension.to_lowercase();
-        let video_preview_backend = self.video_preview_backend;
         let ffmpeg_preview_settings = self.ffmpeg_preview_settings;
+        let repaint_ctx = ctx.clone();
         thread::spawn(move || {
             let preview_started_at = Instant::now();
             log_preview_timing(&path, "preview worker start", preview_started_at.elapsed());
-            let message = match load_preview_bytes(
-                &path,
-                &extension,
-                video_preview_backend,
-                ffmpeg_preview_settings,
-            ) {
+            let message = match load_selected_preview_bytes(&path, &extension, ffmpeg_preview_settings)
+            {
                 Ok(frames) => PreviewLoadResult {
                     path: path.clone(),
                     frames,
@@ -474,14 +518,15 @@ impl FileIndexerApp {
             };
             log_preview_timing(&path, "preview worker complete", preview_started_at.elapsed());
             let _ = sender.send(message);
+            repaint_ctx.request_repaint();
         });
     }
 
-    fn rerender_selected_preview(&mut self) {
-        let Some(path) = self.preview.selected_path.clone() else {
+    fn rerender_selected_preview(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.selected_preview.selected_path.clone() else {
             return;
         };
-        if self.preview.selected_extension.is_empty() {
+        if self.selected_preview.selected_extension.is_empty() {
             return;
         }
 
@@ -492,37 +537,37 @@ impl FileIndexerApp {
                 .and_then(|name| name.to_str())
                 .unwrap_or(&path)
                 .to_string(),
-            extension: self.preview.selected_extension.clone(),
+            extension: self.selected_preview.selected_extension.clone(),
             root: String::new(),
             size_bytes: 0,
             modified_unix_secs: 0,
             score: 0,
         };
 
-        self.preview.selected_path = None;
-        self.set_preview_target(&preview_result);
+        self.selected_preview.selected_path = None;
+        self.set_preview_target(ctx, &preview_result);
     }
 
-    fn poll_preview_loaded(&mut self, ctx: &egui::Context) {
-        let Some(receiver) = self.preview.receiver.as_ref() else {
+    fn poll_selected_preview_loaded(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.selected_preview.receiver.as_ref() else {
             return;
         };
         let Ok(result) = receiver.try_recv() else {
             return;
         };
 
-        self.preview.receiver = None;
-        self.preview.loading = false;
+        self.selected_preview.receiver = None;
+        self.selected_preview.loading = false;
 
-        if self.preview.selected_path.as_deref() != Some(result.path.as_str()) {
+        if self.selected_preview.selected_path.as_deref() != Some(result.path.as_str()) {
             return;
         }
 
-        self.preview.textures.clear();
-        self.preview.error = result.error;
-        self.preview.rendered_path = Some(result.path.clone());
+        self.selected_preview.textures.clear();
+        self.selected_preview.error = result.error;
+        self.selected_preview.rendered_path = Some(result.path.clone());
 
-        if self.preview.error.is_none() {
+        if self.selected_preview.error.is_none() {
             let texture_started_at = Instant::now();
             log_preview_timing(
                 &result.path,
@@ -535,10 +580,13 @@ impl FileIndexerApp {
                     &format!("preview://{}/{}", result.path, index),
                     &frame.bytes,
                 ) {
-                    Ok(texture) => self.preview.textures.push(PreviewTexture { texture }),
+                    Ok(texture) => self
+                        .selected_preview
+                        .textures
+                        .push(PreviewTexture { texture }),
                     Err(err) => {
-                        self.preview.error = Some(err.to_string());
-                        self.preview.textures.clear();
+                        self.selected_preview.error = Some(err.to_string());
+                        self.selected_preview.textures.clear();
                         break;
                     }
                 }
@@ -549,6 +597,113 @@ impl FileIndexerApp {
                 texture_started_at.elapsed(),
             );
         }
+    }
+
+    fn poll_card_previews_loaded(&mut self, ctx: &egui::Context) {
+        let mut processed = 0;
+        while processed < MAX_CARD_PREVIEW_UPLOADS_PER_FRAME {
+            let Ok(result) = self.card_previews.receiver.try_recv() else {
+                break;
+            };
+            self.card_previews.in_flight = self.card_previews.in_flight.saturating_sub(1);
+            let entry = self
+                .card_previews
+                .entries
+                .entry(result.path.clone())
+                .or_default();
+            entry.loading = false;
+            entry.error = result.error;
+            entry.texture = None;
+
+            if entry.error.is_none() {
+                if let Some(pixels) = result.pixels {
+                    let color_image =
+                        egui::ColorImage::from_rgba_unmultiplied(pixels.size, &pixels.rgba);
+                    entry.texture = Some(ctx.load_texture(
+                        format!("card-preview://{}", result.path),
+                        color_image,
+                        Default::default(),
+                    ));
+                }
+            }
+            processed += 1;
+        }
+
+        self.pump_card_preview_queue(ctx);
+    }
+
+    fn ensure_card_preview_requested(&mut self, ctx: &egui::Context, result: &SearchResult) {
+        if !supports_preview(&result.extension) {
+            return;
+        }
+
+        let path = result.full_path.clone();
+        if self
+            .card_previews
+            .entries
+            .get(&path)
+            .is_some_and(|entry| entry.loading || entry.texture.is_some() || entry.error.is_some())
+        {
+            return;
+        }
+
+        self.card_previews.entries.insert(
+            path.clone(),
+            CardPreviewEntry {
+                texture: None,
+                error: None,
+                loading: false,
+                queued: true,
+            },
+        );
+
+        self.card_previews
+            .pending_paths
+            .push_back((path, result.extension.to_lowercase()));
+        self.pump_card_preview_queue(ctx);
+    }
+
+    fn pump_card_preview_queue(&mut self, ctx: &egui::Context) {
+        while self.card_previews.in_flight < MAX_CONCURRENT_CARD_PREVIEW_LOADS {
+            let Some((path, extension)) = self.card_previews.pending_paths.pop_front() else {
+                break;
+            };
+
+            let Some(entry) = self.card_previews.entries.get_mut(&path) else {
+                continue;
+            };
+            if !entry.queued {
+                continue;
+            }
+
+            entry.queued = false;
+            entry.loading = true;
+            let sender = self.card_previews.sender.clone();
+            let repaint_ctx = ctx.clone();
+            self.card_previews.in_flight += 1;
+            thread::spawn(move || {
+                let message = match load_card_preview_pixels(&path, &extension) {
+                    Ok(pixels) => CardPreviewLoadResult {
+                        path: path.clone(),
+                        pixels: Some(pixels),
+                        error: None,
+                    },
+                    Err(err) => CardPreviewLoadResult {
+                        path: path.clone(),
+                        pixels: None,
+                        error: Some(err.to_string()),
+                    },
+                };
+                let _ = sender.send(message);
+                repaint_ctx.request_repaint();
+            });
+        }
+    }
+
+    fn clear_card_previews(&mut self) {
+        self.card_previews.entries.clear();
+        self.card_previews.pending_paths.clear();
+        self.card_previews.in_flight = 0;
     }
 
     fn refresh_active_search(&mut self) {
@@ -567,6 +722,7 @@ impl FileIndexerApp {
             tab.results.clear();
             tab.total_matches = 0;
             tab.title = tab_title(tab.id, &tab.query);
+            self.clear_card_previews();
             self.status = "Ready".to_string();
             return;
         }
@@ -579,12 +735,16 @@ impl FileIndexerApp {
             &sort_direction,
         ) {
             Ok(page_data) => {
-                let tab = self.active_tab_mut();
-                tab.results = page_data.results;
-                tab.total_matches = page_data.total_matches;
-                tab.title = tab_title(tab.id, &tab.query);
+                let total_matches = page_data.total_matches;
+                {
+                    let tab = self.active_tab_mut();
+                    tab.results = page_data.results;
+                    tab.total_matches = total_matches;
+                    tab.title = tab_title(tab.id, &tab.query);
+                }
+                self.clear_card_previews();
 
-                if tab.total_matches == 0 {
+                if total_matches == 0 {
                     self.status = "No matches found".to_string();
                 } else {
                     self.status = "Ready".to_string();
@@ -594,6 +754,7 @@ impl FileIndexerApp {
                 let tab = self.active_tab_mut();
                 tab.results.clear();
                 tab.total_matches = 0;
+                self.clear_card_previews();
                 self.status = format!("Search failed: {err}");
             }
         }
@@ -691,7 +852,7 @@ impl FileIndexerApp {
         self.save_config();
     }
 
-    fn commit_ffmpeg_preview_settings(&mut self) {
+    fn commit_ffmpeg_preview_settings(&mut self, ctx: &egui::Context) {
         let parsed_count = self.ffmpeg_thumbnail_count_input.trim().parse::<usize>();
         let parsed_interval = self.ffmpeg_interval_seconds_input.trim().parse::<u32>();
         let (Ok(thumbnail_count), Ok(interval_seconds)) = (parsed_count, parsed_interval) else {
@@ -713,11 +874,8 @@ impl FileIndexerApp {
         self.ffmpeg_thumbnail_count_input = normalized.thumbnail_count.to_string();
         self.ffmpeg_interval_seconds_input = normalized.interval_seconds.to_string();
 
-        if changed
-            && is_video_extension(&self.preview.selected_extension)
-            && self.video_preview_backend == VideoPreviewBackend::Ffmpeg
-        {
-            self.rerender_selected_preview();
+        if changed && is_video_extension(&self.selected_preview.selected_extension) {
+            self.rerender_selected_preview(ctx);
         }
     }
 
@@ -1027,82 +1185,30 @@ impl eframe::App for FileIndexerApp {
                     });
             });
 
-        self.poll_preview_loaded(ctx);
+        self.poll_selected_preview_loaded(ctx);
+        self.poll_card_previews_loaded(ctx);
 
         egui::SidePanel::right("preview_panel")
-            .resizable(true)
-            .default_width(395.0)
-            .min_width(295.0)
+            .resizable(false)
+            .exact_width(395.0)
             .frame(
                 egui::Frame::new()
                     .fill(Color32::from_rgb(31, 37, 44))
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(ctx, |ui| {
-                let previous_backend = self.video_preview_backend;
-                ui.horizontal(|ui| {
-                    let backend_button = |selected: bool, label: &str| {
-                        egui::Button::new(
-                            RichText::new(label)
-                                .size(SMALL_SIZE - 3.0)
-                                .strong()
-                                .color(Color32::from_rgb(242, 245, 247)),
-                        )
-                        .min_size(egui::vec2(68.0, 20.0))
-                        .fill(if selected {
-                            Color32::from_rgb(57, 83, 106)
-                        } else {
-                            Color32::from_rgb(27, 39, 49)
-                        })
-                        .stroke(Stroke::new(
-                            1.0,
-                            if selected {
-                                Color32::from_rgb(132, 168, 198)
-                            } else {
-                                Color32::from_rgb(56, 78, 92)
-                            },
-                        ))
-                    };
-
-                    ui.label(
-                        RichText::new("Preview")
-                            .size(H2_SIZE)
-                            .strong()
-                            .color(Color32::from_rgb(242, 245, 247)),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(backend_button(
-                                self.video_preview_backend == VideoPreviewBackend::Ffmpeg,
-                                "FFmpeg",
-                            ))
-                            .clicked()
-                        {
-                            self.video_preview_backend = VideoPreviewBackend::Ffmpeg;
-                        }
-                        if ui
-                            .add(backend_button(
-                                self.video_preview_backend == VideoPreviewBackend::WindowsShell,
-                                "Windows",
-                            ))
-                            .clicked()
-                        {
-                            self.video_preview_backend = VideoPreviewBackend::WindowsShell;
-                        }
-                    });
-                });
-                ui.add_space(6.0);
-                let preview_is_video = is_video_extension(&self.preview.selected_extension);
-                if preview_is_video && self.video_preview_backend != previous_backend {
-                    self.rerender_selected_preview();
-                }
+                ui.label(
+                    RichText::new("Preview")
+                        .size(H2_SIZE)
+                        .strong()
+                        .color(Color32::from_rgb(242, 245, 247)),
+                );
                 ui.add_space(6.0);
 
-                if self.preview.selected_path.is_some() {
+                if self.selected_preview.selected_path.is_some() {
                     ui.add_space(2.0);
 
-                    if self.preview.loading {
+                    if self.selected_preview.loading {
                         ui.horizontal(|ui| {
                             ui.spinner();
                             ui.label(
@@ -1111,7 +1217,7 @@ impl eframe::App for FileIndexerApp {
                                     .color(Color32::from_rgb(196, 207, 216)),
                             );
                         });
-                    } else if let Some(error) = self.preview.error.as_deref() {
+                    } else if let Some(error) = self.selected_preview.error.as_deref() {
                         ui.label(
                             RichText::new(error)
                                 .size(BODY_SIZE)
@@ -1119,12 +1225,12 @@ impl eframe::App for FileIndexerApp {
                         );
                         ui.small(
                             RichText::new(
-                                "Video previews use bundled tools from tools/ffmpeg next to the app, or fall back to PATH. Image previews use local Windows decoding.",
+                                "Video previews here always use bundled tools from tools/ffmpeg next to the app, or fall back to PATH. Image previews use local decoding.",
                             )
                             .size(SMALL_SIZE)
                             .color(Color32::from_rgb(176, 192, 203)),
                         );
-                    } else if self.preview.textures.is_empty() {
+                    } else if self.selected_preview.textures.is_empty() {
                         ui.label(
                             RichText::new("Select an image or video result to render a preview")
                                 .size(BODY_SIZE)
@@ -1132,10 +1238,17 @@ impl eframe::App for FileIndexerApp {
                         );
                     } else {
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            for item in &self.preview.textures {
+                            for item in &self.selected_preview.textures {
+                                let texture_size = item.texture.size_vec2();
+                                let width = ui.available_width();
+                                let height = if texture_size.x > 0.0 {
+                                    width * (texture_size.y / texture_size.x)
+                                } else {
+                                    texture_size.y
+                                };
                                 ui.add(
                                     egui::Image::from_texture(&item.texture)
-                                        .max_width(ui.available_width())
+                                        .fit_to_exact_size(egui::vec2(width, height))
                                         .corner_radius(CornerRadius::same(8)),
                                 );
                                 ui.add_space(10.0);
@@ -1475,10 +1588,10 @@ impl eframe::App for FileIndexerApp {
                     let move_down = ctx.input(|input| input.key_pressed(egui::Key::ArrowDown));
                     let move_up = ctx.input(|input| input.key_pressed(egui::Key::ArrowUp));
                     if move_down {
-                        self.move_result_selection(1);
+                        self.move_result_selection(ctx, 1);
                         keyboard_selection_changed = true;
                     } else if move_up {
-                        self.move_result_selection(-1);
+                        self.move_result_selection(ctx, -1);
                         keyboard_selection_changed = true;
                     }
                 }
@@ -1545,13 +1658,20 @@ impl eframe::App for FileIndexerApp {
                 });
                 ui.separator();
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::ScrollArea::vertical().show_rows(
+                    ui,
+                    RESULT_CARD_ROW_HEIGHT,
+                    self.active_tab().results.len(),
+                    |ui, row_range| {
                     let mut pending_preview: Option<SearchResult> = None;
-                    for result in &self.active_tab().results {
-                        let preview_selected = self.preview.selected_path.as_deref()
+                    let results = self.active_tab().results.clone();
+                    for row_index in row_range {
+                        let Some(result) = results.get(row_index) else {
+                            continue;
+                        };
+                        let preview_selected = self.selected_preview.selected_path.as_deref()
                             == Some(result.full_path.as_str());
-                        let preview_supported = is_image_extension(&result.extension)
-                            || is_video_extension(&result.extension);
+                        let preview_supported = supports_preview(&result.extension);
                         let card_fill = if preview_selected {
                             Color32::from_rgb(29, 41, 52)
                         } else {
@@ -1572,53 +1692,74 @@ impl eframe::App for FileIndexerApp {
                                     .inner_margin(egui::Margin::same(12))
                                     .show(ui, |ui| {
                                         ui.set_min_width(ui.available_width());
-                                        ui.vertical(|ui| {
-                                            if ui
-                                                .link(
-                                                    RichText::new(&result.filename)
-                                                        .size(H3_SIZE)
-                                                        .strong()
-                                                        .color(ui.visuals().hyperlink_color),
-                                                )
-                                                .clicked()
-                                            {
-                                                let _ = open_with_registered_app(&result.full_path);
-                                            }
-                                            ui.small(
-                                                RichText::new(result.full_path.as_str())
-                                                    .size(SMALL_SIZE)
-                                                    .color(Color32::from_rgb(198, 208, 216)),
-                                            );
-                                            ui.small(
-                                                RichText::new(format!(
-                                                    "{} | {} bytes | {}",
-                                                    result.root,
-                                                    format_number(result.size_bytes),
-                                                    format_unix_secs(result.modified_unix_secs)
-                                                ))
-                                                .size(SMALL_SIZE)
-                                                .color(Color32::from_rgb(190, 203, 213)),
-                                            );
-                                            ui.add_space(6.0);
-                                            ui.horizontal(|ui| {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::TOP),
+                                            |ui| {
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(CARD_PREVIEW_WIDTH, CARD_PREVIEW_HEIGHT),
+                                                    egui::Layout::top_down(egui::Align::Center),
+                                                    |ui| {
+                                                        draw_card_preview(
+                                                            ui,
+                                                            self.card_previews
+                                                                .entries
+                                                                .get(&result.full_path),
+                                                            preview_supported,
+                                                        );
+                                                    },
+                                                );
+
+                                                ui.add_space(12.0);
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(ui.available_width(), 0.0),
+                                                    egui::Layout::top_down(egui::Align::Min),
+                                                    |ui| {
                                                 if ui
-                                                    .add_enabled(preview_supported, egui::Button::new("Preview"))
+                                                    .link(
+                                                        RichText::new(&result.filename)
+                                                            .size(H3_SIZE)
+                                                            .strong()
+                                                            .color(ui.visuals().hyperlink_color),
+                                                    )
                                                     .clicked()
                                                 {
-                                                    pending_preview = Some(result.clone());
-                                                }
-                                                if ui.button("Open File").clicked() {
                                                     let _ = open_with_registered_app(&result.full_path);
                                                 }
-                                                if ui.button("Reveal in Explorer").clicked() {
-                                                    let _ = open_in_explorer(&result.full_path);
-                                                }
-                                            });
-                                        });
+                                                ui.small(
+                                                    RichText::new(result.full_path.as_str())
+                                                        .size(SMALL_SIZE)
+                                                        .color(Color32::from_rgb(198, 208, 216)),
+                                                );
+                                                ui.small(
+                                                    RichText::new(format!(
+                                                        "{} | {} bytes | {}",
+                                                        result.root,
+                                                        format_number(result.size_bytes),
+                                                        format_unix_secs(result.modified_unix_secs)
+                                                    ))
+                                                    .size(SMALL_SIZE)
+                                                    .color(Color32::from_rgb(190, 203, 213)),
+                                                );
+                                                ui.add_space(6.0);
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("Open File").clicked() {
+                                                        let _ = open_with_registered_app(&result.full_path);
+                                                    }
+                                                    if ui.button("Reveal in Explorer").clicked() {
+                                                        let _ = open_in_explorer(&result.full_path);
+                                                    }
+                                                });
+                                                    },
+                                                );
+                                            },
+                                        );
                                     });
                             },
                         );
                         let card_response = card.response;
+                        if preview_supported {
+                            self.ensure_card_preview_requested(ctx, result);
+                        }
                         if preview_selected && keyboard_selection_changed {
                             card_response.scroll_to_me(Some(egui::Align::Center));
                         }
@@ -1629,13 +1770,14 @@ impl eframe::App for FileIndexerApp {
                     }
 
                     if let Some(result) = pending_preview {
-                        self.set_preview_target(&result);
+                        self.set_preview_target(ctx, &result);
                     }
 
                     if !self.active_tab().query.is_empty() && self.active_tab().results.is_empty() {
                         ui.label("No matches found");
                     }
-                });
+                    },
+                );
             });
 
         if self.drives_popup_open {
@@ -1920,7 +2062,7 @@ impl eframe::App for FileIndexerApp {
                                     && (thumbs_response.has_focus()
                                         || interval_response.has_focus()));
                             if commit_requested {
-                                self.commit_ffmpeg_preview_settings();
+                                self.commit_ffmpeg_preview_settings(ctx);
                             }
                         }
                     });
@@ -2060,6 +2202,10 @@ impl eframe::App for FileIndexerApp {
                 self.open_favorite(&favorite);
             }
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        cleanup_preview_temp_root();
     }
 }
 
@@ -2239,10 +2385,13 @@ fn is_video_extension(extension: &str) -> bool {
     )
 }
 
-fn load_preview_bytes(
+fn supports_preview(extension: &str) -> bool {
+    is_image_extension(extension) || is_video_extension(extension)
+}
+
+fn load_selected_preview_bytes(
     path: &str,
     extension: &str,
-    video_preview_backend: VideoPreviewBackend,
     ffmpeg_preview_settings: FfmpegPreviewSettings,
 ) -> Result<Vec<PreviewFrameBytes>> {
     if is_image_extension(extension) {
@@ -2251,11 +2400,79 @@ fn load_preview_bytes(
     }
 
     if is_video_extension(extension) {
-        let frames = render_video_previews(path, video_preview_backend, ffmpeg_preview_settings)?;
+        let frames = render_video_previews(path, ffmpeg_preview_settings)?;
         return Ok(frames);
     }
 
     anyhow::bail!("Preview is only available for common image and video files")
+}
+
+fn load_card_preview_pixels(path: &str, extension: &str) -> Result<CardPreviewPixels> {
+    if is_image_extension(extension) {
+        return render_image_preview_pixels(path, extension);
+    }
+
+    if is_video_extension(extension) {
+        return render_windows_shell_video_preview_pixels(path);
+    }
+
+    anyhow::bail!("Preview is only available for common image and video files")
+}
+
+fn draw_card_preview(
+    ui: &mut egui::Ui,
+    preview: Option<&CardPreviewEntry>,
+    preview_supported: bool,
+) {
+    egui::Frame::new()
+        .fill(Color32::from_rgb(18, 26, 34))
+        .corner_radius(CornerRadius::same(10))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(46, 62, 74)))
+        .inner_margin(egui::Margin::same(0))
+        .show(ui, |ui| {
+            ui.set_min_size(egui::vec2(CARD_PREVIEW_WIDTH, CARD_PREVIEW_HEIGHT));
+
+            if !preview_supported {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new("No preview")
+                            .size(SMALL_SIZE)
+                            .color(Color32::from_rgb(160, 176, 188)),
+                    );
+                });
+                return;
+            }
+
+            let Some(preview) = preview else {
+                ui.centered_and_justified(|ui| {
+                    ui.spinner();
+                });
+                return;
+            };
+
+            if preview.loading || preview.queued {
+                ui.centered_and_justified(|ui| {
+                    ui.spinner();
+                });
+            } else if preview.error.is_some() {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new("Preview unavailable")
+                            .size(SMALL_SIZE)
+                            .color(Color32::from_rgb(194, 150, 150)),
+                    );
+                });
+            } else if let Some(texture) = &preview.texture {
+                ui.centered_and_justified(|ui| {
+                    ui.add(
+                        egui::Image::from_texture(texture)
+                            .max_width(CARD_PREVIEW_WIDTH)
+                            .max_height(CARD_PREVIEW_HEIGHT)
+                            .corner_radius(CornerRadius::same(10)),
+                    );
+                });
+            }
+        });
 }
 
 fn render_image_preview(path: &str, extension: &str) -> Result<Vec<u8>> {
@@ -2274,60 +2491,97 @@ fn render_image_preview(path: &str, extension: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn render_image_preview_pixels(path: &str, extension: &str) -> Result<CardPreviewPixels> {
+    if extension == "bmp" {
+        let image = image::load_from_memory(&fs::read(path)?)?.to_rgba8();
+        let (width, height) = image.dimensions();
+        return Ok(CardPreviewPixels {
+            size: [width as usize, height as usize],
+            rgba: image.into_raw(),
+        });
+    }
+
+    let mut image = ImageReader::open(path)?.decode()?;
+    let (width, height) = image.dimensions();
+    if width > CARD_PREVIEW_WIDTH as u32 * 2 || height > CARD_PREVIEW_HEIGHT as u32 * 2 {
+        image = DynamicImage::ImageRgba8(
+            image
+                .thumbnail(CARD_PREVIEW_WIDTH as u32 * 2, CARD_PREVIEW_HEIGHT as u32 * 2)
+                .to_rgba8(),
+        );
+    }
+
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Ok(CardPreviewPixels {
+        size: [width as usize, height as usize],
+        rgba: rgba.into_raw(),
+    })
+}
+
 fn render_video_previews(
     path: &str,
-    backend: VideoPreviewBackend,
     ffmpeg_preview_settings: FfmpegPreviewSettings,
 ) -> Result<Vec<PreviewFrameBytes>> {
-    match backend {
-        VideoPreviewBackend::WindowsShell => {
-            let bytes = render_windows_shell_video_preview(path)?;
-            Ok(vec![PreviewFrameBytes { bytes }])
-        }
-        VideoPreviewBackend::Ffmpeg => {
-            let ffmpeg_path = find_media_tool("ffmpeg")?;
-            let output_dir = preview_temp_dir(path, "video");
-            if output_dir.exists() {
-                let _ = fs::remove_dir_all(&output_dir);
-            }
-            fs::create_dir_all(&output_dir)?;
-
-            run_ffmpeg_preview_frames(&ffmpeg_path, path, &output_dir, ffmpeg_preview_settings)?;
-
-            let read_started_at = Instant::now();
-            log_preview_timing(path, "ffmpeg frame read start", read_started_at.elapsed());
-            let mut frame_paths = fs::read_dir(&output_dir)?
-                .filter_map(|entry| entry.ok().map(|value| value.path()))
-                .filter(|frame_path| {
-                    frame_path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .map(|ext| ext.eq_ignore_ascii_case("bmp"))
-                        .unwrap_or(false)
-                })
-                .collect::<Vec<_>>();
-            frame_paths.sort();
-
-            let frames = frame_paths
-                .into_iter()
-                .map(|frame_path| fs::read(frame_path).map(|bytes| PreviewFrameBytes { bytes }))
-                .collect::<std::io::Result<Vec<_>>>()?;
-            log_preview_timing(path, "ffmpeg frame read complete", read_started_at.elapsed());
-
-            if frames.is_empty() {
-                anyhow::bail!("ffmpeg did not render any preview frames for {path}");
-            }
-
-            Ok(frames)
-        }
+    let ffmpeg_path = find_media_tool("ffmpeg")?;
+    let output_dir = preview_temp_dir(path, "video");
+    if output_dir.exists() {
+        let _ = fs::remove_dir_all(&output_dir);
     }
+    fs::create_dir_all(&output_dir)?;
+
+    run_ffmpeg_preview_frames(&ffmpeg_path, path, &output_dir, ffmpeg_preview_settings)?;
+
+    let read_started_at = Instant::now();
+    log_preview_timing(path, "ffmpeg frame read start", read_started_at.elapsed());
+    let mut frame_paths = fs::read_dir(&output_dir)?
+        .filter_map(|entry| entry.ok().map(|value| value.path()))
+        .filter(|frame_path| {
+            frame_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("bmp"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    frame_paths.sort();
+
+    let frames = frame_paths
+        .into_iter()
+        .map(|frame_path| fs::read(frame_path).map(|bytes| PreviewFrameBytes { bytes }))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    log_preview_timing(path, "ffmpeg frame read complete", read_started_at.elapsed());
+
+    if frames.is_empty() {
+        anyhow::bail!("ffmpeg did not render any preview frames for {path}");
+    }
+
+    Ok(frames)
 }
 
 fn preview_temp_dir(path: &str, kind: &str) -> std::path::PathBuf {
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
     let hash = hasher.finish();
-    env::temp_dir().join("file_indexer_previews").join(format!("{kind}_{hash}"))
+    app_temp_root()
+        .join("file_indexer_previews")
+        .join(format!("{kind}_{hash}"))
+}
+
+fn app_temp_root() -> std::path::PathBuf {
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            return exe_dir.join(".tmp");
+        }
+    }
+
+    env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".tmp")
+}
+
+fn cleanup_preview_temp_root() {
+    let _ = fs::remove_dir_all(app_temp_root().join("file_indexer_previews"));
 }
 
 fn log_preview_timing(path: &str, stage: &str, elapsed: std::time::Duration) {
@@ -2427,7 +2681,7 @@ fn load_preview_texture(ctx: &egui::Context, uri: &str, bytes: &[u8]) -> Result<
     Ok(ctx.load_texture(uri.to_string(), color_image, Default::default()))
 }
 
-fn render_windows_shell_video_preview(path: &str) -> Result<Vec<u8>> {
+fn render_windows_shell_video_preview_pixels(path: &str) -> Result<CardPreviewPixels> {
     let mut wide: Vec<u16> = std::ffi::OsStr::new(path).encode_wide().collect();
     wide.push(0);
 
@@ -2436,11 +2690,14 @@ fn render_windows_shell_video_preview(path: &str) -> Result<Vec<u8>> {
         let shell_item: IShellItemImageFactory =
             SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None)?;
         let bitmap: HBITMAP = shell_item.GetImage(
-            SIZE { cx: 360, cy: 240 },
+            SIZE {
+                cx: CARD_PREVIEW_WIDTH as i32,
+                cy: CARD_PREVIEW_HEIGHT as i32,
+            },
             SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK | SIIGBF_RESIZETOFIT,
         )?;
 
-        let result = hbitmap_to_bmp_bytes(bitmap);
+        let result = hbitmap_to_card_preview_pixels(bitmap);
         let _ = DeleteObject(bitmap.into());
         if com_init {
             CoUninitialize();
@@ -2449,7 +2706,7 @@ fn render_windows_shell_video_preview(path: &str) -> Result<Vec<u8>> {
     }
 }
 
-fn hbitmap_to_bmp_bytes(bitmap: HBITMAP) -> Result<Vec<u8>> {
+fn hbitmap_to_card_preview_pixels(bitmap: HBITMAP) -> Result<CardPreviewPixels> {
     unsafe {
         let mut info = BITMAP::default();
         let object_size = i32::try_from(size_of::<BITMAP>())?;
@@ -2497,11 +2754,10 @@ fn hbitmap_to_bmp_bytes(bitmap: HBITMAP) -> Result<Vec<u8>> {
             pixel.swap(0, 2);
         }
 
-        let image = RgbaImage::from_raw(width as u32, height as u32, rgba)
-            .ok_or_else(|| anyhow::anyhow!("Failed to convert Windows preview bitmap"))?;
-        let mut bytes = Vec::new();
-        DynamicImage::ImageRgba8(image).write_to(&mut Cursor::new(&mut bytes), ImageFormat::Bmp)?;
-        Ok(bytes)
+        Ok(CardPreviewPixels {
+            size: [width as usize, height as usize],
+            rgba,
+        })
     }
 }
 
