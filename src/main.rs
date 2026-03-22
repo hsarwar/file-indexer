@@ -30,8 +30,9 @@ use index::{
     FfmpegPreviewSettings, IndexStore, PreviewExtensionSettings, RootScanInfo, SearchResult,
 };
 use windows::{
+    core::{GUID, PCWSTR},
     Win32::{
-        Foundation::SIZE,
+        Foundation::{PROPERTYKEY, SIZE},
         Graphics::Gdi::{
             BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS,
             DeleteDC, DeleteObject, GetDIBits, GetObjectW, HBITMAP, ReleaseDC,
@@ -39,12 +40,11 @@ use windows::{
         System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
         UI::{
             Shell::{
-                IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK,
+                IShellItem2, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK,
                 SIIGBF_RESIZETOFIT, SIIGBF_THUMBNAILONLY,
             },
         },
     },
-    core::PCWSTR,
 };
 use scanner::ScanStats;
 use scanner::ScanFilter;
@@ -62,6 +62,10 @@ const DEFAULT_WINDOW_HEIGHT: f32 = 900.0;
 const DEFAULT_FFMPEG_PREVIEW_FRAME_COUNT: usize = 15;
 const DEFAULT_FFMPEG_PREVIEW_INTERVAL_SECONDS: u32 = 120;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const PKEY_MEDIA_DURATION: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0x64440490_4c8b_11d1_8b70_080036b11a03),
+    pid: 3,
+};
 const CARD_PREVIEW_WIDTH: f32 = 220.0;
 const CARD_PREVIEW_HEIGHT: f32 = 124.0;
 const RESULT_CARD_ROW_HEIGHT: f32 = 168.0;
@@ -317,6 +321,7 @@ struct FileIndexerApp {
     startup_maximize_delay_frames: u8,
     selected_preview: SelectedPreviewState,
     card_previews: CardPreviewState,
+    card_durations: CardDurationState,
 }
 
 struct SearchTab {
@@ -387,6 +392,26 @@ struct CardPreviewState {
     receiver: Receiver<CardPreviewLoadResult>,
 }
 
+struct CardDurationLoadResult {
+    path: String,
+    duration_seconds: Option<u64>,
+}
+
+#[derive(Default)]
+struct CardDurationEntry {
+    duration_seconds: Option<u64>,
+    loading: bool,
+    queued: bool,
+}
+
+struct CardDurationState {
+    entries: HashMap<String, CardDurationEntry>,
+    pending_paths: VecDeque<String>,
+    in_flight: usize,
+    sender: Sender<CardDurationLoadResult>,
+    receiver: Receiver<CardDurationLoadResult>,
+}
+
 enum ScanMessage {
     Progress { root: String, indexed_files: usize },
     Completed { stats: ScanStats },
@@ -423,6 +448,7 @@ impl FileIndexerApp {
         let last_scan_label = format_last_scan(db.last_scan_unix_secs().ok().flatten());
         let root_scan_info = map_root_scan_info(db.root_scan_info().unwrap_or_default());
         let (card_preview_sender, card_preview_receiver) = mpsc::channel();
+        let (card_duration_sender, card_duration_receiver) = mpsc::channel();
 
         Ok(Self {
             config,
@@ -464,6 +490,13 @@ impl FileIndexerApp {
                 in_flight: 0,
                 sender: card_preview_sender,
                 receiver: card_preview_receiver,
+            },
+            card_durations: CardDurationState {
+                entries: HashMap::new(),
+                pending_paths: VecDeque::new(),
+                in_flight: 0,
+                sender: card_duration_sender,
+                receiver: card_duration_receiver,
             },
         })
     }
@@ -661,6 +694,22 @@ impl FileIndexerApp {
         self.pump_card_preview_queue(ctx);
     }
 
+    fn poll_card_durations_loaded(&mut self, ctx: &egui::Context) {
+        while let Ok(result) = self.card_durations.receiver.try_recv() {
+            self.card_durations.in_flight = self.card_durations.in_flight.saturating_sub(1);
+            let entry = self
+                .card_durations
+                .entries
+                .entry(result.path)
+                .or_default();
+            entry.loading = false;
+            entry.queued = false;
+            entry.duration_seconds = result.duration_seconds;
+        }
+
+        self.pump_card_duration_queue(ctx);
+    }
+
     fn ensure_card_preview_requested(&mut self, ctx: &egui::Context, result: &SearchResult) {
         if !self.supports_preview(&result.extension) {
             return;
@@ -690,6 +739,33 @@ impl FileIndexerApp {
             .pending_paths
             .push_back((path, result.extension.to_lowercase()));
         self.pump_card_preview_queue(ctx);
+    }
+
+    fn ensure_card_duration_requested(&mut self, ctx: &egui::Context, result: &SearchResult) {
+        if !self.is_video_extension(&result.extension) {
+            return;
+        }
+
+        let path = result.full_path.clone();
+        if self
+            .card_durations
+            .entries
+            .get(&path)
+            .is_some_and(|entry| entry.loading || entry.queued || entry.duration_seconds.is_some())
+        {
+            return;
+        }
+
+        self.card_durations.entries.insert(
+            path.clone(),
+            CardDurationEntry {
+                duration_seconds: None,
+                loading: false,
+                queued: true,
+            },
+        );
+        self.card_durations.pending_paths.push_back(path);
+        self.pump_card_duration_queue(ctx);
     }
 
     fn pump_card_preview_queue(&mut self, ctx: &egui::Context) {
@@ -736,10 +812,41 @@ impl FileIndexerApp {
         }
     }
 
+    fn pump_card_duration_queue(&mut self, ctx: &egui::Context) {
+        while self.card_durations.in_flight < MAX_CONCURRENT_CARD_PREVIEW_LOADS {
+            let Some(path) = self.card_durations.pending_paths.pop_front() else {
+                break;
+            };
+
+            let Some(entry) = self.card_durations.entries.get_mut(&path) else {
+                continue;
+            };
+            if !entry.queued {
+                continue;
+            }
+
+            entry.queued = false;
+            entry.loading = true;
+            let sender = self.card_durations.sender.clone();
+            let repaint_ctx = ctx.clone();
+            self.card_durations.in_flight += 1;
+            thread::spawn(move || {
+                let _ = sender.send(CardDurationLoadResult {
+                    path: path.clone(),
+                    duration_seconds: load_windows_media_duration_seconds(&path),
+                });
+                repaint_ctx.request_repaint();
+            });
+        }
+    }
+
     fn clear_card_previews(&mut self) {
         self.card_previews.entries.clear();
         self.card_previews.pending_paths.clear();
         self.card_previews.in_flight = 0;
+        self.card_durations.entries.clear();
+        self.card_durations.pending_paths.clear();
+        self.card_durations.in_flight = 0;
     }
 
     fn refresh_active_search(&mut self) {
@@ -1269,6 +1376,7 @@ impl eframe::App for FileIndexerApp {
 
         self.poll_selected_preview_loaded(ctx);
         self.poll_card_previews_loaded(ctx);
+        self.poll_card_durations_loaded(ctx);
 
         egui::SidePanel::right("preview_panel")
             .resizable(false)
@@ -1754,6 +1862,12 @@ impl eframe::App for FileIndexerApp {
                         let preview_selected = self.selected_preview.selected_path.as_deref()
                             == Some(result.full_path.as_str());
                         let preview_supported = self.supports_preview(&result.extension);
+                        let duration_label = self
+                            .card_durations
+                            .entries
+                            .get(&result.full_path)
+                            .and_then(|entry| entry.duration_seconds)
+                            .map(format_duration_seconds);
                         let card_fill = if preview_selected {
                             Color32::from_rgb(29, 41, 52)
                         } else {
@@ -1814,13 +1928,17 @@ impl eframe::App for FileIndexerApp {
                                                 );
                                                 ui.small(
                                                     RichText::new(format!(
-                                                        "{} | {} bytes | {}",
+                                                        "{} | {} bytes | {}{}",
                                                         result.root,
                                                         format_number(result.size_bytes),
-                                                        format_unix_secs(result.modified_unix_secs)
+                                                        format_unix_secs(result.modified_unix_secs),
+                                                        duration_label
+                                                            .as_deref()
+                                                            .map(|value| format!(" | {value}"))
+                                                            .unwrap_or_default()
                                                     ))
                                                     .size(SMALL_SIZE)
-                                                    .color(Color32::from_rgb(190, 203, 213)),
+                                                    .color(Color32::from_rgb(206, 186, 142)),
                                                 );
                                                 ui.add_space(6.0);
                                                 ui.horizontal(|ui| {
@@ -1842,6 +1960,7 @@ impl eframe::App for FileIndexerApp {
                         if preview_supported {
                             self.ensure_card_preview_requested(ctx, result);
                         }
+                        self.ensure_card_duration_requested(ctx, result);
                         if preview_selected && keyboard_selection_changed {
                             card_response.scroll_to_me(Some(egui::Align::Center));
                         }
@@ -2472,6 +2591,17 @@ fn format_unix_secs(value: i64) -> String {
     local_time.format("%Y-%m-%d %I:%M %p").to_string()
 }
 
+fn format_duration_seconds(value: u64) -> String {
+    let hours = value / 3600;
+    let minutes = (value % 3600) / 60;
+    let seconds = value % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
 fn page_count(total_matches: i64, page_size: usize) -> usize {
     if total_matches <= 0 {
         return 0;
@@ -2772,13 +2902,13 @@ fn run_ffmpeg_preview_frames(
 ) -> Result<()> {
     let ffmpeg_started_at = Instant::now();
     log_preview_timing(path, "ffmpeg extraction start", ffmpeg_started_at.elapsed());
+    let seek_times = ffmpeg_preview_seek_times(path, settings);
 
     let mut command = Command::new(ffmpeg_path);
     command.creation_flags(CREATE_NO_WINDOW);
     command.arg("-y").arg("-loglevel").arg("error");
 
-    for index in 0..settings.thumbnail_count {
-        let seek_secs = index as u32 * settings.interval_seconds;
+    for (index, seek_secs) in seek_times.into_iter().enumerate() {
         let output_path = output_dir.join(format!("frame_{:02}.bmp", index + 1));
         command
             .arg("-ss")
@@ -2805,6 +2935,49 @@ fn run_ffmpeg_preview_frames(
             anyhow::bail!("ffmpeg was not found. Put ffmpeg.exe in tools/ffmpeg next to the app or on PATH")
         }
         Err(err) => Err(err.into()),
+    }
+}
+
+fn ffmpeg_preview_seek_times(path: &str, settings: FfmpegPreviewSettings) -> Vec<u32> {
+    let requested = (0..settings.thumbnail_count)
+        .map(|index| index as u32 * settings.interval_seconds)
+        .collect::<Vec<_>>();
+
+    let Some(duration_seconds) = load_windows_media_duration_seconds(path) else {
+        return requested;
+    };
+
+    if duration_seconds == 0 {
+        return vec![0];
+    }
+
+    let mut seek_times = requested
+        .into_iter()
+        .filter(|seek_secs| u64::from(*seek_secs) < duration_seconds)
+        .collect::<Vec<_>>();
+    if seek_times.is_empty() {
+        seek_times.push(0);
+    }
+    seek_times
+}
+
+fn load_windows_media_duration_seconds(path: &str) -> Option<u64> {
+    let mut wide: Vec<u16> = std::ffi::OsStr::new(path).encode_wide().collect();
+    wide.push(0);
+
+    unsafe {
+        let com_init = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let result = (|| {
+            let shell_item: IShellItem2 =
+                SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+            let duration_100ns = shell_item.GetUInt64(&PKEY_MEDIA_DURATION).ok()?;
+            let seconds = duration_100ns.div_ceil(10_000_000);
+            Some(seconds)
+        })();
+        if com_init {
+            CoUninitialize();
+        }
+        result
     }
 }
 
