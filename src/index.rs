@@ -55,6 +55,12 @@ pub struct FfmpegPreviewSettings {
     pub interval_seconds: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreviewExtensionSettings {
+    pub image_extensions: String,
+    pub video_extensions: String,
+}
+
 pub struct IndexStore {
     db_path: PathBuf,
 }
@@ -307,6 +313,44 @@ impl IndexStore {
         Ok(normalized)
     }
 
+    pub fn load_preview_extension_settings(&self) -> Result<PreviewExtensionSettings> {
+        let conn = self.open()?;
+        let image_extensions =
+            load_optional_setting_string(&conn, "preview_image_extensions")?.unwrap_or_else(
+                || "png jpg jpeg bmp gif webp tif tiff".to_string(),
+            );
+        let video_extensions =
+            load_optional_setting_string(&conn, "preview_video_extensions")?.unwrap_or_else(
+                || "mp4 mkv avi mov webm wmv m4v mpg mpeg".to_string(),
+            );
+        Ok(PreviewExtensionSettings {
+            image_extensions,
+            video_extensions,
+        })
+    }
+
+    pub fn save_preview_extension_settings(
+        &self,
+        settings: &PreviewExtensionSettings,
+    ) -> Result<PreviewExtensionSettings> {
+        let normalized = PreviewExtensionSettings {
+            image_extensions: normalize_extensions_text(&settings.image_extensions),
+            video_extensions: normalize_extensions_text(&settings.video_extensions),
+        };
+        let conn = self.open()?;
+        save_setting_string(
+            &conn,
+            "preview_image_extensions",
+            &normalized.image_extensions,
+        )?;
+        save_setting_string(
+            &conn,
+            "preview_video_extensions",
+            &normalized.video_extensions,
+        )?;
+        Ok(normalized)
+    }
+
     pub fn load_app_config(&self, legacy: Option<&AppConfig>) -> Result<AppConfig> {
         let conn = self.open()?;
         let defaults = AppConfig::default();
@@ -539,6 +583,17 @@ fn load_optional_setting_string(conn: &Connection, key: &str) -> Result<Option<S
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(err) => Err(err.into()),
     }
+}
+
+fn normalize_extensions_text(raw: &str) -> String {
+    let mut extensions = raw
+        .split_whitespace()
+        .map(|item| item.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    extensions.sort();
+    extensions.dedup();
+    extensions.join(" ")
 }
 
 fn save_setting_json<T>(conn: &Connection, key: &str, value: &T) -> Result<()>

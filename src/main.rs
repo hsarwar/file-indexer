@@ -26,7 +26,9 @@ use config::{
 };
 use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke, Vec2};
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
-use index::{FfmpegPreviewSettings, IndexStore, RootScanInfo, SearchResult};
+use index::{
+    FfmpegPreviewSettings, IndexStore, PreviewExtensionSettings, RootScanInfo, SearchResult,
+};
 use windows::{
     Win32::{
         Foundation::SIZE,
@@ -304,6 +306,11 @@ struct FileIndexerApp {
     ffmpeg_preview_settings: FfmpegPreviewSettings,
     ffmpeg_thumbnail_count_input: String,
     ffmpeg_interval_seconds_input: String,
+    preview_extension_settings: PreviewExtensionSettings,
+    preview_image_extensions_input: String,
+    preview_video_extensions_input: String,
+    preview_image_extensions: std::collections::HashSet<String>,
+    preview_video_extensions: std::collections::HashSet<String>,
     index_all_extensions: bool,
     indexed_extensions_input: String,
     min_index_size_bytes_input: String,
@@ -403,6 +410,12 @@ impl FileIndexerApp {
                 thumbnail_count: DEFAULT_FFMPEG_PREVIEW_FRAME_COUNT,
                 interval_seconds: DEFAULT_FFMPEG_PREVIEW_INTERVAL_SECONDS,
             });
+        let preview_extension_settings = db
+            .load_preview_extension_settings()
+            .unwrap_or(PreviewExtensionSettings {
+                image_extensions: "png jpg jpeg bmp gif webp tif tiff".to_string(),
+                video_extensions: "mp4 mkv avi mov webm wmv m4v mpg mpeg".to_string(),
+            });
         let index_all_extensions = config.index_all_extensions;
         let indexed_extensions_input = config.indexed_extensions.clone();
         let min_index_size_bytes_input = config.min_index_size_bytes.to_string();
@@ -430,10 +443,19 @@ impl FileIndexerApp {
             options_popup_open: false,
             ffmpeg_thumbnail_count_input: ffmpeg_preview_settings.thumbnail_count.to_string(),
             ffmpeg_interval_seconds_input: ffmpeg_preview_settings.interval_seconds.to_string(),
+            preview_image_extensions_input: preview_extension_settings.image_extensions.clone(),
+            preview_video_extensions_input: preview_extension_settings.video_extensions.clone(),
+            preview_image_extensions: parse_extension_filter(
+                &preview_extension_settings.image_extensions,
+            ),
+            preview_video_extensions: parse_extension_filter(
+                &preview_extension_settings.video_extensions,
+            ),
             index_all_extensions,
             indexed_extensions_input,
             min_index_size_bytes_input,
             ffmpeg_preview_settings,
+            preview_extension_settings,
             startup_maximize_delay_frames: 8,
             selected_preview: SelectedPreviewState::default(),
             card_previews: CardPreviewState {
@@ -499,12 +521,19 @@ impl FileIndexerApp {
         let path = result.full_path.clone();
         let extension = result.extension.to_lowercase();
         let ffmpeg_preview_settings = self.ffmpeg_preview_settings;
+        let preview_image_extensions = self.preview_image_extensions.clone();
+        let preview_video_extensions = self.preview_video_extensions.clone();
         let repaint_ctx = ctx.clone();
         thread::spawn(move || {
             let preview_started_at = Instant::now();
             log_preview_timing(&path, "preview worker start", preview_started_at.elapsed());
-            let message = match load_selected_preview_bytes(&path, &extension, ffmpeg_preview_settings)
-            {
+            let message = match load_selected_preview_bytes(
+                &path,
+                &extension,
+                &preview_image_extensions,
+                &preview_video_extensions,
+                ffmpeg_preview_settings,
+            ) {
                 Ok(frames) => PreviewLoadResult {
                     path: path.clone(),
                     frames,
@@ -633,7 +662,7 @@ impl FileIndexerApp {
     }
 
     fn ensure_card_preview_requested(&mut self, ctx: &egui::Context, result: &SearchResult) {
-        if !supports_preview(&result.extension) {
+        if !self.supports_preview(&result.extension) {
             return;
         }
 
@@ -679,10 +708,17 @@ impl FileIndexerApp {
             entry.queued = false;
             entry.loading = true;
             let sender = self.card_previews.sender.clone();
+            let preview_image_extensions = self.preview_image_extensions.clone();
+            let preview_video_extensions = self.preview_video_extensions.clone();
             let repaint_ctx = ctx.clone();
             self.card_previews.in_flight += 1;
             thread::spawn(move || {
-                let message = match load_card_preview_pixels(&path, &extension) {
+                let message = match load_card_preview_pixels(
+                    &path,
+                    &extension,
+                    &preview_image_extensions,
+                    &preview_video_extensions,
+                ) {
                     Ok(pixels) => CardPreviewLoadResult {
                         path: path.clone(),
                         pixels: Some(pixels),
@@ -874,9 +910,55 @@ impl FileIndexerApp {
         self.ffmpeg_thumbnail_count_input = normalized.thumbnail_count.to_string();
         self.ffmpeg_interval_seconds_input = normalized.interval_seconds.to_string();
 
-        if changed && is_video_extension(&self.selected_preview.selected_extension) {
+        if changed && self.is_video_extension(&self.selected_preview.selected_extension) {
             self.rerender_selected_preview(ctx);
         }
+    }
+
+    fn commit_preview_extension_settings(&mut self, ctx: &egui::Context) {
+        let requested = PreviewExtensionSettings {
+            image_extensions: self.preview_image_extensions_input.clone(),
+            video_extensions: self.preview_video_extensions_input.clone(),
+        };
+        let Ok(normalized) = self.db.save_preview_extension_settings(&requested) else {
+            self.status = "Failed to save preview extension settings".to_string();
+            return;
+        };
+
+        let changed = normalized.image_extensions != self.preview_extension_settings.image_extensions
+            || normalized.video_extensions != self.preview_extension_settings.video_extensions;
+        self.preview_image_extensions_input = normalized.image_extensions.clone();
+        self.preview_video_extensions_input = normalized.video_extensions.clone();
+        self.preview_image_extensions = parse_extension_filter(&normalized.image_extensions);
+        self.preview_video_extensions = parse_extension_filter(&normalized.video_extensions);
+        self.preview_extension_settings = normalized;
+
+        if changed {
+            if self.selected_preview.selected_path.is_some() {
+                if self.supports_preview(&self.selected_preview.selected_extension) {
+                    self.rerender_selected_preview(ctx);
+                } else {
+                    self.selected_preview.textures.clear();
+                    self.selected_preview.loading = false;
+                    self.selected_preview.receiver = None;
+                    self.selected_preview.error =
+                        Some("Preview is disabled for this extension in Options".to_string());
+                }
+            }
+            self.clear_card_previews();
+        }
+    }
+
+    fn is_image_extension(&self, extension: &str) -> bool {
+        self.preview_image_extensions.contains(&extension.to_ascii_lowercase())
+    }
+
+    fn is_video_extension(&self, extension: &str) -> bool {
+        self.preview_video_extensions.contains(&extension.to_ascii_lowercase())
+    }
+
+    fn supports_preview(&self, extension: &str) -> bool {
+        self.is_image_extension(extension) || self.is_video_extension(extension)
     }
 
     fn reload_index_stats(&mut self) {
@@ -1671,7 +1753,7 @@ impl eframe::App for FileIndexerApp {
                         };
                         let preview_selected = self.selected_preview.selected_path.as_deref()
                             == Some(result.full_path.as_str());
-                        let preview_supported = supports_preview(&result.extension);
+                        let preview_supported = self.supports_preview(&result.extension);
                         let card_fill = if preview_selected {
                             Color32::from_rgb(29, 41, 52)
                         } else {
@@ -1979,7 +2061,7 @@ impl eframe::App for FileIndexerApp {
                 .open(&mut popup_open)
                 .collapsible(false)
                 .resizable(false)
-                .default_width(420.0)
+                .default_width(520.0)
                 .frame(
                     egui::Frame::new()
                         .fill(Color32::from_rgb(24, 32, 40))
@@ -2020,6 +2102,8 @@ impl eframe::App for FileIndexerApp {
 
                         let mut thumbs_response = None;
                         let mut interval_response = None;
+                        let mut image_extensions_response = None;
+                        let mut video_extensions_response = None;
                         egui::Grid::new("options_ffmpeg_grid")
                             .num_columns(2)
                             .spacing(egui::vec2(12.0, 8.0))
@@ -2049,20 +2133,62 @@ impl eframe::App for FileIndexerApp {
                                     ),
                                 ));
                                 ui.end_row();
+
+                                ui.label(
+                                    RichText::new("Image preview extensions")
+                                        .size(SMALL_SIZE - 1.0)
+                                        .color(Color32::from_rgb(176, 192, 203)),
+                                );
+                                image_extensions_response = Some(ui.add_sized(
+                                    [280.0, 20.0],
+                                    egui::TextEdit::singleline(
+                                        &mut self.preview_image_extensions_input,
+                                    )
+                                    .hint_text("png jpg jpeg bmp gif webp tif tiff"),
+                                ));
+                                ui.end_row();
+
+                                ui.label(
+                                    RichText::new("Video preview extensions")
+                                        .size(SMALL_SIZE - 1.0)
+                                        .color(Color32::from_rgb(176, 192, 203)),
+                                );
+                                video_extensions_response = Some(ui.add_sized(
+                                    [280.0, 20.0],
+                                    egui::TextEdit::singleline(
+                                        &mut self.preview_video_extensions_input,
+                                    )
+                                    .hint_text("mp4 mkv avi mov webm wmv m4v mpg mpeg"),
+                                ));
+                                ui.end_row();
                             });
 
-                        if let (Some(thumbs_response), Some(interval_response)) =
-                            (thumbs_response, interval_response)
+                        if let (
+                            Some(thumbs_response),
+                            Some(interval_response),
+                            Some(image_extensions_response),
+                            Some(video_extensions_response),
+                        ) = (
+                            thumbs_response,
+                            interval_response,
+                            image_extensions_response,
+                            video_extensions_response,
+                        )
                         {
                             let enter_pressed =
                                 ui.input(|input| input.key_pressed(egui::Key::Enter));
                             let commit_requested = thumbs_response.lost_focus()
                                 || interval_response.lost_focus()
+                                || image_extensions_response.lost_focus()
+                                || video_extensions_response.lost_focus()
                                 || (enter_pressed
                                     && (thumbs_response.has_focus()
-                                        || interval_response.has_focus()));
+                                        || interval_response.has_focus()
+                                        || image_extensions_response.has_focus()
+                                        || video_extensions_response.has_focus()));
                             if commit_requested {
                                 self.commit_ffmpeg_preview_settings(ctx);
+                                self.commit_preview_extension_settings(ctx);
                             }
                         }
                     });
@@ -2371,35 +2497,19 @@ fn file_count_label_for_root(info: Option<&RootScanInfo>) -> String {
         .unwrap_or_else(|| "Indexed files: 0".to_string())
 }
 
-fn is_image_extension(extension: &str) -> bool {
-    matches!(
-        extension,
-        "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp" | "tif" | "tiff"
-    )
-}
-
-fn is_video_extension(extension: &str) -> bool {
-    matches!(
-        extension,
-        "mp4" | "mkv" | "avi" | "mov" | "webm" | "wmv" | "m4v" | "mpg" | "mpeg"
-    )
-}
-
-fn supports_preview(extension: &str) -> bool {
-    is_image_extension(extension) || is_video_extension(extension)
-}
-
 fn load_selected_preview_bytes(
     path: &str,
     extension: &str,
+    image_extensions: &std::collections::HashSet<String>,
+    video_extensions: &std::collections::HashSet<String>,
     ffmpeg_preview_settings: FfmpegPreviewSettings,
 ) -> Result<Vec<PreviewFrameBytes>> {
-    if is_image_extension(extension) {
+    if image_extensions.contains(extension) {
         let image = render_image_preview(path, extension)?;
         return Ok(vec![PreviewFrameBytes { bytes: image }]);
     }
 
-    if is_video_extension(extension) {
+    if video_extensions.contains(extension) {
         let frames = render_video_previews(path, ffmpeg_preview_settings)?;
         return Ok(frames);
     }
@@ -2407,12 +2517,17 @@ fn load_selected_preview_bytes(
     anyhow::bail!("Preview is only available for common image and video files")
 }
 
-fn load_card_preview_pixels(path: &str, extension: &str) -> Result<CardPreviewPixels> {
-    if is_image_extension(extension) {
+fn load_card_preview_pixels(
+    path: &str,
+    extension: &str,
+    image_extensions: &std::collections::HashSet<String>,
+    video_extensions: &std::collections::HashSet<String>,
+) -> Result<CardPreviewPixels> {
+    if image_extensions.contains(extension) {
         return render_image_preview_pixels(path, extension);
     }
 
-    if is_video_extension(extension) {
+    if video_extensions.contains(extension) {
         return render_windows_shell_video_preview_pixels(path);
     }
 
@@ -2524,28 +2639,20 @@ fn render_video_previews(
     ffmpeg_preview_settings: FfmpegPreviewSettings,
 ) -> Result<Vec<PreviewFrameBytes>> {
     let ffmpeg_path = find_media_tool("ffmpeg")?;
-    let output_dir = preview_temp_dir(path, "video");
-    if output_dir.exists() {
-        let _ = fs::remove_dir_all(&output_dir);
-    }
-    fs::create_dir_all(&output_dir)?;
+    let output_dir = preview_temp_dir(path, "video", Some(ffmpeg_preview_settings));
+    let mut frame_paths = discover_ffmpeg_frame_paths(&output_dir);
 
-    run_ffmpeg_preview_frames(&ffmpeg_path, path, &output_dir, ffmpeg_preview_settings)?;
+    if frame_paths.is_empty() {
+        if output_dir.exists() {
+            let _ = fs::remove_dir_all(&output_dir);
+        }
+        fs::create_dir_all(&output_dir)?;
+        run_ffmpeg_preview_frames(&ffmpeg_path, path, &output_dir, ffmpeg_preview_settings)?;
+        frame_paths = discover_ffmpeg_frame_paths(&output_dir);
+    }
 
     let read_started_at = Instant::now();
     log_preview_timing(path, "ffmpeg frame read start", read_started_at.elapsed());
-    let mut frame_paths = fs::read_dir(&output_dir)?
-        .filter_map(|entry| entry.ok().map(|value| value.path()))
-        .filter(|frame_path| {
-            frame_path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("bmp"))
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    frame_paths.sort();
-
     let frames = frame_paths
         .into_iter()
         .map(|frame_path| fs::read(frame_path).map(|bytes| PreviewFrameBytes { bytes }))
@@ -2559,13 +2666,43 @@ fn render_video_previews(
     Ok(frames)
 }
 
-fn preview_temp_dir(path: &str, kind: &str) -> std::path::PathBuf {
+fn preview_temp_dir(
+    path: &str,
+    kind: &str,
+    ffmpeg_preview_settings: Option<FfmpegPreviewSettings>,
+) -> std::path::PathBuf {
     let mut hasher = DefaultHasher::new();
+    const PREVIEW_CACHE_VERSION: u32 = 2;
+    PREVIEW_CACHE_VERSION.hash(&mut hasher);
+    kind.hash(&mut hasher);
     path.hash(&mut hasher);
+    if let Some(settings) = ffmpeg_preview_settings {
+        settings.thumbnail_count.hash(&mut hasher);
+        settings.interval_seconds.hash(&mut hasher);
+    }
     let hash = hasher.finish();
     app_temp_root()
         .join("file_indexer_previews")
         .join(format!("{kind}_{hash}"))
+}
+
+fn discover_ffmpeg_frame_paths(output_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = fs::read_dir(output_dir) else {
+        return Vec::new();
+    };
+
+    let mut frame_paths = entries
+        .filter_map(|entry| entry.ok().map(|value| value.path()))
+        .filter(|frame_path| {
+            frame_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("bmp"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    frame_paths.sort();
+    frame_paths
 }
 
 fn app_temp_root() -> std::path::PathBuf {
